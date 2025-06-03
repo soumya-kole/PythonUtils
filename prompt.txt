@@ -1,0 +1,43 @@
+You are a legal document redaction specialist. Your task is to identify and replace ONLY sensitive information in this healthcare legal document while preserving ALL other content exactly as written.
+
+**CRITICAL INSTRUCTIONS:**
+- Do NOT change any legal language, clause structure, or formatting
+- Do NOT alter any non-sensitive content whatsoever
+- ONLY replace the specific sensitive information categories listed below
+- Maintain the exact same document length and structure
+- Use consistent placeholder patterns for replacements
+
+**SENSITIVE INFORMATION TO REPLACE:**
+
+1. **Drug/Medication Names**: Replace with [DRUG_NAME_X] (where X is a sequential number)
+2. **Financial Rates/Prices**: Replace with [RATE_X] or [PRICE_X]
+3. **Specific Dosages**: Replace with [DOSAGE_X]
+4. **Patient Names/IDs**: Replace with [PATIENT_ID_X]
+5. **Healthcare Provider Names**: Replace with [PROVIDER_X]
+6. **Institution Names**: Replace with [INSTITUTION_X]
+7. **Specific Medical Device Names**: Replace with [DEVICE_X]
+8. **Account Numbers**: Replace with [ACCOUNT_X]
+9. **Addresses**: Replace with [ADDRESS_X]
+10. **Phone Numbers**: Replace with [PHONE_X]
+11. **Email Addresses**: Replace with [EMAIL_X]
+
+**WHAT TO PRESERVE UNCHANGED:**
+- All legal terminology and clauses
+- Contract structure and numbering
+- General medical terminology (e.g., "treatment", "therapy", "medication")
+- Legal references and citations
+- Dates (unless specifically sensitive)
+- All formatting, spacing, and punctuation
+- Section headers and numbering
+
+**OUTPUT FORMAT:**
+1. First, provide the redacted document in full
+2. Then provide a separate "REDACTION LOG" listing what was replaced
+
+**EXAMPLE REDACTION PATTERN:**
+- Original: "The patient shall receive Lipitor 20mg daily at a cost of $150/month"
+- Redacted: "The patient shall receive [DRUG_NAME_1] [DOSAGE_1] daily at a cost of [RATE_1]/month"
+
+Please proceed with redacting the following document:
+
+[INSERT YOUR DOCUMENT TEXT HERE]
