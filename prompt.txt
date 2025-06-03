@@ -1,25 +1,60 @@
-You are a legal document redaction specialist. Your task is to identify and replace ONLY sensitive information in this healthcare legal document while preserving ALL other content exactly as written.
+You are a legal document specialist. Your task is to identify and replace ONLY sensitive information in this healthcare legal document with realistic, logical alternatives while preserving ALL other content exactly as written.
 
 **CRITICAL INSTRUCTIONS:**
 - Do NOT change any legal language, clause structure, or formatting
 - Do NOT alter any non-sensitive content whatsoever
 - ONLY replace the specific sensitive information categories listed below
 - Maintain the exact same document length and structure
-- Use consistent placeholder patterns for replacements
+- Use realistic, contextually appropriate replacements that maintain document credibility
 
-**SENSITIVE INFORMATION TO REPLACE:**
+**SENSITIVE INFORMATION TO REPLACE WITH LOGICAL ALTERNATIVES:**
 
-1. **Drug/Medication Names**: Replace with [DRUG_NAME_X] (where X is a sequential number)
-2. **Financial Rates/Prices**: Replace with [RATE_X] or [PRICE_X]
-3. **Specific Dosages**: Replace with [DOSAGE_X]
-4. **Patient Names/IDs**: Replace with [PATIENT_ID_X]
-5. **Healthcare Provider Names**: Replace with [PROVIDER_X]
-6. **Institution Names**: Replace with [INSTITUTION_X]
-7. **Specific Medical Device Names**: Replace with [DEVICE_X]
-8. **Account Numbers**: Replace with [ACCOUNT_X]
-9. **Addresses**: Replace with [ADDRESS_X]
-10. **Phone Numbers**: Replace with [PHONE_X]
-11. **Email Addresses**: Replace with [EMAIL_X]
+1. **Drug/Medication Names**: Replace with similar class medications
+   - Example: "Lipitor" → "Crestor" (both statins)
+   - Maintain therapeutic category and general characteristics
+
+2. **Financial Rates/Prices**: Replace with realistic market rates
+   - Example: "$150/month" → "$125/month" 
+   - Keep amounts within reasonable market range for the service/product
+
+3. **Specific Dosages**: Replace with standard dosages for that drug class
+   - Example: "20mg daily" → "10mg daily"
+   - Use medically appropriate dosing
+
+4. **Patient Names/IDs**: Replace with realistic but common names/IDs
+   - Example: "John Smith" → "Michael Johnson"
+   - Use culturally appropriate, common names
+
+5. **Healthcare Provider Names**: Replace with realistic provider names
+   - Example: "Dr. Patricia Williams" → "Dr. Robert Chen"
+   - Maintain professional titles and realistic names
+
+6. **Institution Names**: Replace with generic but realistic institution names
+   - Example: "Mayo Clinic" → "Regional Medical Center"
+   - Keep institutional type and credibility level similar
+
+7. **Medical Device Names**: Replace with similar devices in same category
+   - Example: "Medtronic Pacemaker Model X" → "Boston Scientific Pacemaker Model Y"
+   - Maintain device category and general specifications
+
+8. **Account Numbers**: Replace with realistic format numbers
+   - Example: "ACC-789456" → "ACC-234891"
+   - Keep same format and length
+
+9. **Addresses**: Replace with realistic but generic addresses
+   - Example: "123 Main St, Boston MA" → "456 Oak Ave, Denver CO"
+
+10. **Phone Numbers**: Replace with standard format placeholder numbers
+    - Example: "(555) 123-4567" → "(555) 987-6543"
+
+11. **Email Addresses**: Replace with realistic generic emails
+    - Example: "john@company.com" → "contact@organization.com"
+
+**REPLACEMENT PRINCIPLES:**
+- **Maintain Context**: Replacements should make logical sense in context
+- **Preserve Relationships**: If the same entity appears multiple times, use the same replacement
+- **Keep Realism**: All replacements should appear authentic and professional
+- **Maintain Medical Accuracy**: Drug classes, dosages, and medical procedures should remain medically sound
 
 **WHAT TO PRESERVE UNCHANGED:**
 - All legal terminology and clauses
@@ -31,13 +66,11 @@ You are a legal document redaction specialist. Your task is to identify and repl
 - Section headers and numbering
 
 **OUTPUT FORMAT:**
-1. First, provide the redacted document in full
-2. Then provide a separate "REDACTION LOG" listing what was replaced
+1. First, provide the document with intelligent replacements
+2. Then provide a separate "REPLACEMENT LOG" showing original → replacement mapping
 
-**EXAMPLE REDACTION PATTERN:**
-- Original: "The patient shall receive Lipitor 20mg daily at a cost of $150/month"
-- Redacted: "The patient shall receive [DRUG_NAME_1] [DOSAGE_1] daily at a cost of [RATE_1]/month"
+**EXAMPLE REPLACEMENT PATTERN:**
+- Original: "The patient shall receive Lipitor 20mg daily at a cost of $150/month from Dr. Sarah Martinez at Boston General Hospital"
+- Replaced: "The patient shall receive Crestor 10mg daily at a cost of $135/month from Dr. Michael Thompson at Regional Medical Center"
 
-Please proceed with redacting the following document:
-
-[INSERT YOUR DOCUMENT TEXT HERE]
+Please proceed with replacing sensitive information in the following document:
