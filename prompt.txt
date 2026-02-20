@@ -1,458 +1,125 @@
-# 🤖 ADK Multi-Agent Framework — Cursor Vibe Coding Prompt
+Authentication System – Requirements and High-Level Design
+1. Objective
 
-> Copy this entire prompt into Cursor's AI chat (or any AI coding assistant).
-> It will scaffold the full framework from scratch, ready to extend.
+Design and implement a secure authentication system for a web application using:
 
----
+Frontend: Next.js
 
-## PROMPT START — COPY EVERYTHING BELOW THIS LINE
+Backend: FastAPI
 
----
+Database: PostgreSQL
 
-You are an expert Python architect specializing in Google ADK (Agent Development Kit) multi-agent systems.
+Authentication Mechanism: JWT-based authentication using HttpOnly cookies
 
-Build me a **production-grade agent management framework** on top of Google ADK that lets me manage a large number of nested agents (potentially 50–100+) without manual wiring. I want a clean, scalable codebase I can extend indefinitely.
+The system must support secure user registration, admin-controlled verification, login, token refresh, logout, and access to protected APIs.
 
----
+2. Functional Requirements
+2.1 User Registration (Signup)
 
-## STACK & DEPENDENCIES
+The system must allow users to register with:
 
-- **Python 3.11+**
-- **Google ADK** (`pip install google-adk`) — use `LlmAgent`, `SequentialAgent`, `ParallelAgent`, `BaseAgent`
-- **Pydantic v2** — for config/schema validation if needed
-- **Standard library only** for the framework core (`importlib`, `pkgutil`, `contextvars`, `dataclasses`, `logging`, `asyncio`)
-- Default LLM model: `gemini-2.0-flash` (configurable per agent)
+Email
 
----
-
-## ARCHITECTURE OVERVIEW
+Password
 
-Build this exact layered architecture:
+Full name
 
-```
-┌─────────────────────────────────────────────────────┐
-│                   main.py (entry point)              │
-│   bootstrap → middleware → discover → resolve → run  │
-├─────────────────────────────────────────────────────┤
-│               framework/core.py                      │
-│   ToolRegistry | AgentRegistry | @tool | @agent      │
-│   Middleware pipeline | ContextVars | discover()     │
-├─────────────────────────────────────────────────────┤
-│               agents/ package                        │
-│   tools.py          ← all tool functions             │
-│   root.py           ← custom intent router           │
-│   <domain>/         ← one sub-package per domain     │
-│     __init__.py     ← domain-level agent             │
-│     leaf_agents.py  ← leaf LLM agents                │
-└─────────────────────────────────────────────────────┘
-```
-
----
-
-## PROJECT STRUCTURE
-
-Generate this exact file structure:
-
-```
-project/
-├── framework/
-│   ├── __init__.py         ← re-export public API
-│   └── core.py             ← entire framework engine
-├── agents/
-│   ├── __init__.py         ← empty package marker
-│   ├── tools.py            ← all tool functions
-│   ├── root.py             ← RootAgent (custom BaseAgent router)
-│   ├── <domain_1>/
-│   │   ├── __init__.py     ← domain agent (Sequential or Parallel)
-│   │   └── leaf_agents.py  ← leaf LLM agents
-│   └── <domain_2>/         ← repeat for each domain
-│       ├── __init__.py
-│       └── leaf_agents.py
-└── main.py                 ← bootstrap + ADK runner
-```
-
-Replace `<domain_1>`, `<domain_2>` with the actual business domains I describe below.
-
----
-
-## FRAMEWORK ENGINE — `framework/core.py`
-
-Implement **all of the following** in a single file:
-
-### A. ContextVars (implicit per-request state)
-
-```python
-from contextvars import ContextVar
-current_user: ContextVar[dict] = ContextVar("current_user", default={})
-current_session: ContextVar[str] = ContextVar("current_session", default="unknown")
-```
-
-These must be readable from any tool or agent without passing them as parameters.
-
-### B. Middleware Protocol + 3 built-in implementations
-
-Define a `Protocol` class:
-```python
-class AgentMiddleware(Protocol):
-    async def before_call(self, agent_name: str, inputs: dict) -> dict: ...
-    async def after_call(self, agent_name: str, inputs: dict, output: Any) -> Any: ...
-```
-
-Implement:
-1. **`LoggingMiddleware`** — logs `[→] CALL agent=... session=... user=...` and `[←] RETURN agent=...` using the `logging` module
-2. **`TracingMiddleware`** — measures wall-clock latency per agent using `time.perf_counter()`, logs `[TRACE] agent=... elapsed=Xms`
-3. **`MetricsMiddleware`** — accumulates call count and total latency per agent; exposes a `.report() -> str` method that prints a formatted summary table
-
-### C. ToolRegistry
-
-```python
-@dataclass
-class ToolDefinition:
-    name: str
-    fn: Callable
-    description: str
-    tags: list[str]
-
-class ToolRegistry:
-    _tools: dict[str, ToolDefinition] = {}
-
-    @classmethod
-    def register(cls, name, description, tags=None): ...   # returns decorator
-    @classmethod
-    def get(cls, name) -> ToolDefinition | None: ...
-    @classmethod
-    def get_callables(cls, names: list[str]) -> list[Callable]: ...  # raises KeyError if missing
-    @classmethod
-    def all(cls) -> dict: ...
-```
-
-### D. AgentRegistry
-
-```python
-@dataclass
-class AgentDefinition:
-    name: str
-    agent_type: str        # "llm" | "sequential" | "parallel" | "custom"
-    factory: Callable      # factory(tools, sub_agents) → ADK agent instance
-    tools: list[str]
-    sub_agents: list[str]
-    parent: str | None
-    description: str
-    _instance: Any = None  # cached after first resolve
-
-class AgentRegistry:
-    _agents: dict[str, AgentDefinition] = {}
-    _middleware: list[AgentMiddleware] = []
-
-    @classmethod
-    def register(cls, definition: AgentDefinition): ...
-
-    @classmethod
-    def add_middleware(cls, *middleware): ...
-
-    @classmethod
-    def resolve(cls, name: str) -> Any:
-        # MUST be recursive: resolve sub_agents first, then call factory
-        # MUST cache result in _instance so it's a singleton
-        ...
-
-    @classmethod
-    def get_tree(cls, root="root_agent", indent=0) -> str:
-        # Returns indented tree like:
-        # root_agent [custom]
-        #   └─ sales_agent [sequential]
-        #        └─ product_catalog_agent [llm]  tools=[search_products]
-        ...
-
-    @classmethod
-    def all(cls) -> dict: ...
-
-    @classmethod
-    def reset(cls): ...   # clears all _instance caches (for testing)
-```
-
-### E. `@tool` decorator
-
-```python
-def tool(name: str, description: str, tags: list[str] | None = None):
-    """Registers a plain function into ToolRegistry at import time."""
-    return ToolRegistry.register(name, description, tags)
-```
-
-### F. `@agent` class decorator
-
-```python
-def agent(
-    name: str,
-    agent_type: str = "llm",
-    tools: list[str] | None = None,
-    sub_agents: list[str] | None = None,
-    parent: str | None = None,
-    description: str = "",
-):
-    """
-    Registers a class into AgentRegistry at import time.
-    The decorated class MUST implement:
-        @staticmethod
-        def build(tools: list[Callable], sub_agents: list) -> <ADK agent>
-    """
-```
-
-### G. `discover(package_name: str)` function
-
-```python
-def discover(package_name: str) -> None:
-    """
-    Walks every module in the given package using pkgutil.walk_packages
-    and imports each one. Because decorators fire at import time,
-    this single call populates both registries automatically.
-    """
-```
-
----
-
-## AGENT PATTERNS — HOW TO IMPLEMENT EACH TYPE
-
-### LLM Agent (leaf node)
-```python
-@agent(name="my_agent", agent_type="llm", tools=["tool_a", "tool_b"], parent="parent_agent")
-class MyAgent:
-    @staticmethod
-    def build(tools: list, sub_agents: list) -> LlmAgent:
-        return LlmAgent(
-            name="my_agent",
-            model="gemini-2.0-flash",
-            instruction="You are a specialist that...",
-            tools=tools,
-        )
-```
-
-### Sequential Agent (ordered pipeline)
-```python
-@agent(name="pipeline_agent", agent_type="sequential", sub_agents=["step1", "step2"], parent="root_agent")
-class PipelineAgent:
-    @staticmethod
-    def build(tools: list, sub_agents: list) -> SequentialAgent:
-        return SequentialAgent(name="pipeline_agent", sub_agents=sub_agents)
-```
-
-### Parallel Agent (concurrent execution)
-```python
-@agent(name="parallel_agent", agent_type="parallel", sub_agents=["worker_a", "worker_b"], parent="root_agent")
-class MyParallelAgent:
-    @staticmethod
-    def build(tools: list, sub_agents: list) -> ParallelAgent:
-        return ParallelAgent(name="parallel_agent", sub_agents=sub_agents)
-```
-
-### Custom Agent (full control, routing logic)
-```python
-class _RouterImpl(BaseAgent):
-    async def _run_async_impl(self, ctx: InvocationContext) -> AsyncGenerator[Event, None]:
-        # classify intent from ctx.session.events[-1]
-        # delegate to correct sub_agent
-        target = next(a for a in self.sub_agents if a.name == chosen_name)
-        async for event in target.run_async(ctx):
-            yield event
-
-@agent(name="root_agent", agent_type="custom", sub_agents=[...])
-class RootAgent:
-    @staticmethod
-    def build(tools, sub_agents) -> _RouterImpl:
-        return _RouterImpl(name="root_agent", sub_agents=sub_agents)
-```
-
----
-
-## BUSINESS DOMAIN — WHAT TO BUILD
-
-> **[REPLACE THIS SECTION with your actual domain when using the prompt]**
-
-Build an **e-commerce customer platform** with the following agent hierarchy:
-
-```
-root_agent [custom — intent router]
-  ├── sales_agent [sequential]
-  │     ├── product_catalog_agent [llm]   tools: search_products, get_product_details
-  │     └── order_agent [llm]             tools: check_inventory, create_order
-  ├── support_agent [parallel]
-  │     ├── ticket_agent [llm]            tools: create_ticket, get_ticket_status, escalate_ticket
-  │     └── knowledge_base_agent [llm]    tools: search_knowledge_base
-  └── finance_agent [sequential]
-        ├── billing_agent [llm]           tools: get_invoice, process_payment
-        └── refund_agent [llm]            tools: check_refund_eligibility, process_refund
-```
-
-**Intent routing rules** (implement in `root.py` using regex on user message):
-- keywords: `buy / order / purchase / product / price / stock` → `sales_agent`
-- keywords: `help / issue / problem / not working / ticket / bug / error` → `support_agent`
-- keywords: `invoice / payment / bill / charge / refund / receipt` → `finance_agent`
-- fallback → `support_agent`
-
-**Tools** (all in `agents/tools.py`, use simulated/mock return data):
-
-| Tool name | Parameters | Returns |
-|---|---|---|
-| `search_products` | query, category, limit | list of matching products |
-| `get_product_details` | product_id | specs, price, stock, rating |
-| `check_inventory` | product_id, quantity | available count, in_stock bool |
-| `create_order` | product_id, quantity, shipping_address | order_id, status, eta_days |
-| `create_ticket` | subject, description, priority | ticket_id, sla_hours |
-| `get_ticket_status` | ticket_id | status, last_note, updated |
-| `search_knowledge_base` | query, limit | list of matching articles |
-| `escalate_ticket` | ticket_id, reason, tier | new status, new sla |
-| `get_invoice` | invoice_id | amount, status, due_date, items |
-| `process_payment` | invoice_id, amount, payment_method | success, transaction_id |
-| `check_refund_eligibility` | order_id | eligible bool, days_since_purchase, reason |
-| `process_refund` | order_id, amount, reason | refund_id, eta_days |
-
-All tools should:
-- Read `current_user.get()` to include customer ID in responses
-- Return realistic-looking mock data (use `random` for IDs and variability)
-- Be decorated with `@tool(name=..., description=..., tags=[...])`
-
----
-
-## `main.py` — BOOTSTRAP SEQUENCE
-
-Implement in this exact order:
-
-```python
-async def main():
-    # 1. Configure logging (DEBUG level, human-readable format)
-    # 2. Instantiate metrics = MetricsMiddleware()
-    # 3. AgentRegistry.add_middleware(LoggingMiddleware(), TracingMiddleware(), metrics)
-    # 4. discover("agents")            ← auto-imports everything
-    # 5. Print AgentRegistry.get_tree(root="root_agent")
-    # 6. root = AgentRegistry.resolve("root_agent")   ← lazy build
-    # 7. runner = Runner(agent=root, app_name=..., session_service=InMemorySessionService())
-    # 8. Run 3 demo messages — one per intent — using runner.run_async(...)
-    # 9. Print metrics.report()
-```
-
-For demo messages, set `current_user` and `current_session` ContextVars before each call.
-
----
-
-## SYSTEM PROMPT QUALITY GUIDELINES
-
-For every `LlmAgent`, write a **detailed, role-specific system prompt** that:
-1. Declares a clear persona ("You are a billing specialist")
-2. Lists numbered steps for the happy path
-3. Handles the unhappy path explicitly (missing data, failures, edge cases)
-4. Specifies which tool to call in which order
-5. States any hard constraints ("Never approve a refund without calling check_refund_eligibility first")
-
----
-
-## CODING STANDARDS — FOLLOW STRICTLY
-
-1. **One class per agent** with a static `build()` method — no standalone functions as factories
-2. **All registrations happen at decorator time** (import time) — `main.py` must not manually call any `register()` method
-3. **Lazy instantiation** — `resolve()` builds agents on first call only; cached forever after
-4. **Explicit sub-agent imports** — inside `agents/sales/__init__.py`, import leaf agents BEFORE the `@agent` decorator fires, so children are registered first:
-   ```python
-   from agents.sales.leaf_agents import ProductCatalogAgent, OrderAgent  # noqa: F401
-   ```
-5. **Type hints everywhere** — use `list[str]`, `dict[str, Any]`, `Callable`, `AsyncGenerator`
-6. **`from __future__ import annotations`** at the top of every file
-7. **No circular imports** — framework/ must never import from agents/
-8. **Docstrings on every class and public method**
-
----
-
-## TESTING CHECKLIST (verify after generating)
-
-After generating all files, mentally verify:
-
-- [ ] `discover("agents")` imports `agents.tools` → all `@tool` decorators fire
-- [ ] `discover("agents")` imports `agents.sales` → which imports `agents.sales.leaf_agents` → all `@agent` decorators fire bottom-up
-- [ ] `AgentRegistry.resolve("root_agent")` builds the full tree without errors
-- [ ] `AgentRegistry.get_tree()` prints a correct indented hierarchy
-- [ ] The 3 demo messages each route to the correct domain agent
-- [ ] No agent or tool is wired manually in `main.py`
-
----
-
-## EXTENSIBILITY CONTRACT
-
-The framework must make the following operations require **zero changes to existing files**:
-
-| Operation | What to do |
-|---|---|
-| Add a new tool | Add `@tool` decorated function to `agents/tools.py` |
-| Add a new leaf agent | New file with `@agent(parent="existing_agent")` |
-| Add new domain | New sub-package under `agents/` + add name to `root_agent`'s `sub_agents` |
-| Add middleware | Implement `before_call` / `after_call`, call `AgentRegistry.add_middleware()` in `main.py` |
-| Swap LLM model | Change `model=` in the agent's `build()` method |
-| Add routing intent | Add pattern to `_INTENT_PATTERNS` dict in `root.py` |
-
----
-
-## WHAT NOT TO DO
-
-- ❌ Do NOT import specific agents in `main.py` (discovery handles it)
-- ❌ Do NOT instantiate agents directly — always use `AgentRegistry.resolve()`
-- ❌ Do NOT put tool logic inside agent files — all tools live in `agents/tools.py`
-- ❌ Do NOT use `global` variables — use `ContextVar` for shared state
-- ❌ Do NOT hardcode agent names as strings anywhere except the `@agent(name=...)` declaration and the parent's `sub_agents` list
-- ❌ Do NOT catch all exceptions silently — let errors surface with context
-
----
-
-## DELIVERABLES
-
-Generate the following files in order:
-
-1. `framework/__init__.py`
-2. `framework/core.py`
-3. `agents/__init__.py`
-4. `agents/tools.py`
-5. `agents/sales/leaf_agents.py`
-6. `agents/sales/__init__.py`
-7. `agents/support/leaf_agents.py`
-8. `agents/support/__init__.py`
-9. `agents/finance/leaf_agents.py`
-10. `agents/finance/__init__.py`
-11. `agents/root.py`
-12. `main.py`
-
-After generating all files, show the final directory tree and the expected console output when `python main.py` is run.
-
----
-
-## PROMPT END
-
----
-
-## HOW TO CUSTOMIZE FOR YOUR OWN PROJECT
-
-Replace the **Business Domain** section with your own:
-
-```
-## MY AGENT HIERARCHY
-
-root_agent [custom]
-  ├── <your_domain_1>_agent [sequential | parallel | custom]
-  │     ├── <leaf_agent_a> [llm]   tools: [tool_1, tool_2]
-  │     └── <leaf_agent_b> [llm]   tools: [tool_3]
-  └── <your_domain_2>_agent [sequential]
-        ├── <leaf_agent_c> [llm]   tools: [tool_4, tool_5]
-        └── <leaf_agent_d> [llm]   tools: [tool_6]
-
-## MY TOOLS
-
-| Tool name  | Parameters       | Returns         | Purpose              |
-|------------|------------------|-----------------|----------------------|
-| tool_1     | param_a, param_b | {result: ...}   | Does X               |
-| tool_2     | param_c          | {data: ...}     | Does Y               |
-```
-
-**Quick guide on which agent type to pick:**
-
-| Situation | Use |
-|---|---|
-| Steps depend on previous output (A → B → C) | `SequentialAgent` |
-| Steps are independent and can run together | `ParallelAgent` |
-| Need custom routing / branching / loops | Custom `BaseAgent` |
-| Single task with tools, no sub-agents | `LlmAgent` |
+The system must:
+
+Ensure email uniqueness.
+
+Hash passwords before storing them in the database.
+
+Create users with:
+
+is_active = true
+
+is_verified = false (default)
+
+After signup:
+
+The user cannot log in until verified by an admin.
+
+The API should return a success message indicating that verification is pending.
+
+2.2 Admin Verification
+
+Only an administrator can set:
+
+is_verified = true
+
+Users must not be able to log in if:
+
+is_verified = false
+
+is_active = false
+
+Verification will be handled manually from the backend (admin-controlled).
+
+2.3 Login
+
+Users authenticate using:
+
+Email
+
+Password
+
+The system must:
+
+Validate credentials.
+
+Reject login if:
+
+User does not exist.
+
+Password is incorrect.
+
+is_active = false
+
+is_verified = false
+
+On successful authentication:
+
+Generate:
+
+Short-lived Access Token
+
+Long-lived Refresh Token
+
+Store both tokens in HttpOnly cookies.
+
+2.4 Access to Protected Endpoints
+
+Protected APIs must:
+
+Require a valid access token.
+
+Extract user identity from the JWT.
+
+Deny access if token is invalid or expired.
+
+Tokens must be automatically included by the browser via cookies.
+
+2.5 Token Refresh
+
+If the access token expires:
+
+The client calls a refresh endpoint.
+
+The refresh token is validated.
+
+A new access token is issued.
+
+The access token cookie is replaced.
+
+2.6 Logout
+
+Logout endpoint must:
+
+Clear access token cookie.
+
+Clear refresh token cookie.
+
+After logout:
+
+The user must not be able to access protected routes.
