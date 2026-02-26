@@ -1,76 +1,125 @@
-You are a legal document specialist. Your task is to identify and replace ONLY sensitive information in this healthcare legal document with realistic, logical alternatives while preserving ALL other content exactly as written.
+Authentication System – Requirements and High-Level Design
+1. Objective
 
-**CRITICAL INSTRUCTIONS:**
-- Do NOT change any legal language, clause structure, or formatting
-- Do NOT alter any non-sensitive content whatsoever
-- ONLY replace the specific sensitive information categories listed below
-- Maintain the exact same document length and structure
-- Use realistic, contextually appropriate replacements that maintain document credibility
+Design and implement a secure authentication system for a web application using:
 
-**SENSITIVE INFORMATION TO REPLACE WITH LOGICAL ALTERNATIVES:**
+Frontend: Next.js
 
-1. **Drug/Medication Names**: Replace with similar class medications
-   - Example: "Lipitor" → "Crestor" (both statins)
-   - Maintain therapeutic category and general characteristics
+Backend: FastAPI
 
-2. **Financial Rates/Prices**: Replace with realistic market rates
-   - Example: "$150/month" → "$125/month" 
-   - Keep amounts within reasonable market range for the service/product
+Database: PostgreSQL
 
-3. **Specific Dosages**: Replace with standard dosages for that drug class
-   - Example: "20mg daily" → "10mg daily"
-   - Use medically appropriate dosing
+Authentication Mechanism: JWT-based authentication using HttpOnly cookies
 
-4. **Patient Names/IDs**: Replace with realistic but common names/IDs
-   - Example: "John Smith" → "Michael Johnson"
-   - Use culturally appropriate, common names
+The system must support secure user registration, admin-controlled verification, login, token refresh, logout, and access to protected APIs.
 
-5. **Healthcare Provider Names**: Replace with realistic provider names
-   - Example: "Dr. Patricia Williams" → "Dr. Robert Chen"
-   - Maintain professional titles and realistic names
+2. Functional Requirements
+2.1 User Registration (Signup)
 
-6. **Institution Names**: Replace with generic but realistic institution names
-   - Example: "Mayo Clinic" → "Regional Medical Center"
-   - Keep institutional type and credibility level similar
+The system must allow users to register with:
 
-7. **Medical Device Names**: Replace with similar devices in same category
-   - Example: "Medtronic Pacemaker Model X" → "Boston Scientific Pacemaker Model Y"
-   - Maintain device category and general specifications
+Email
 
-8. **Account Numbers**: Replace with realistic format numbers
-   - Example: "ACC-789456" → "ACC-234891"
-   - Keep same format and length
+Password
 
-9. **Addresses**: Replace with realistic but generic addresses
-   - Example: "123 Main St, Boston MA" → "456 Oak Ave, Denver CO"
+Full name
 
-10. **Phone Numbers**: Replace with standard format placeholder numbers
-    - Example: "(555) 123-4567" → "(555) 987-6543"
+The system must:
 
-11. **Email Addresses**: Replace with realistic generic emails
-    - Example: "john@company.com" → "contact@organization.com"
+Ensure email uniqueness.
 
-**REPLACEMENT PRINCIPLES:**
-- **Maintain Context**: Replacements should make logical sense in context
-- **Preserve Relationships**: If the same entity appears multiple times, use the same replacement
-- **Keep Realism**: All replacements should appear authentic and professional
-- **Maintain Medical Accuracy**: Drug classes, dosages, and medical procedures should remain medically sound
+Hash passwords before storing them in the database.
 
-**WHAT TO PRESERVE UNCHANGED:**
-- All legal terminology and clauses
-- Contract structure and numbering
-- General medical terminology (e.g., "treatment", "therapy", "medication")
-- Legal references and citations
-- Dates (unless specifically sensitive)
-- All formatting, spacing, and punctuation
-- Section headers and numbering
+Create users with:
 
-**OUTPUT FORMAT:**
-1. First, provide the document with intelligent replacements
-2. Then provide a separate "REPLACEMENT LOG" showing original → replacement mapping
+is_active = true
 
-**EXAMPLE REPLACEMENT PATTERN:**
-- Original: "The patient shall receive Lipitor 20mg daily at a cost of $150/month from Dr. Sarah Martinez at Boston General Hospital"
-- Replaced: "The patient shall receive Crestor 10mg daily at a cost of $135/month from Dr. Michael Thompson at Regional Medical Center"
+is_verified = false (default)
 
-Please proceed with replacing sensitive information in the following document:
+After signup:
+
+The user cannot log in until verified by an admin.
+
+The API should return a success message indicating that verification is pending.
+
+2.2 Admin Verification
+
+Only an administrator can set:
+
+is_verified = true
+
+Users must not be able to log in if:
+
+is_verified = false
+
+is_active = false
+
+Verification will be handled manually from the backend (admin-controlled).
+
+2.3 Login
+
+Users authenticate using:
+
+Email
+
+Password
+
+The system must:
+
+Validate credentials.
+
+Reject login if:
+
+User does not exist.
+
+Password is incorrect.
+
+is_active = false
+
+is_verified = false
+
+On successful authentication:
+
+Generate:
+
+Short-lived Access Token
+
+Long-lived Refresh Token
+
+Store both tokens in HttpOnly cookies.
+
+2.4 Access to Protected Endpoints
+
+Protected APIs must:
+
+Require a valid access token.
+
+Extract user identity from the JWT.
+
+Deny access if token is invalid or expired.
+
+Tokens must be automatically included by the browser via cookies.
+
+2.5 Token Refresh
+
+If the access token expires:
+
+The client calls a refresh endpoint.
+
+The refresh token is validated.
+
+A new access token is issued.
+
+The access token cookie is replaced.
+
+2.6 Logout
+
+Logout endpoint must:
+
+Clear access token cookie.
+
+Clear refresh token cookie.
+
+After logout:
+
+The user must not be able to access protected routes.
