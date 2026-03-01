@@ -1,125 +1,174 @@
-Authentication System – Requirements and High-Level Design
-1. Objective
+import json
+import time
+import uuid
+from collections import defaultdict
+from google.adk.agents import LlmAgent
+from google.adk.tools import BaseTool
 
-Design and implement a secure authentication system for a web application using:
+# ──────────────────────────────────────────────
+# 1. ENHANCED GRAPH with execution_log per node
+# ──────────────────────────────────────────────
 
-Frontend: Next.js
+def extract_agent_graph(agent):
+    """Recursively traverses an ADK Agent to build a graph dictionary."""
+    graph_node = {
+        "name": agent.name,
+        "type": agent.__class__.__name__,
+        "description": agent.description,
+        "tools": {},       # tool_name -> { meta + execution_log[] }
+        "sub_agents": [],
+        "execution_log": []  # [{run_id, start, end, duration}]
+    }
 
-Backend: FastAPI
+    if getattr(agent, "tools", None):
+        for tool in agent.tools:
+            tool_name = getattr(tool, "name", getattr(tool, "__name__", type(tool).__name__))
+            graph_node["tools"][tool_name] = {
+                "type": type(tool).__name__,
+                "execution_log": []   # [{run_id, start, end, duration, args_snapshot}]
+            }
 
-Database: PostgreSQL
+    if getattr(agent, "sub_agents", None):
+        for sub_agent in agent.sub_agents:
+            graph_node["sub_agents"].append(extract_agent_graph(sub_agent))
 
-Authentication Mechanism: JWT-based authentication using HttpOnly cookies
+    return graph_node
 
-The system must support secure user registration, admin-controlled verification, login, token refresh, logout, and access to protected APIs.
 
-2. Functional Requirements
-2.1 User Registration (Signup)
+# ──────────────────────────────────────────────
+# 2. TRACKER — owns the graph + pending timers
+# ──────────────────────────────────────────────
 
-The system must allow users to register with:
+class ExecutionTracker:
+    """
+    Stores the agent graph and records timing for every agent/tool execution.
 
-Email
+    Identity strategy
+    -----------------
+    Each execution is uniquely identified by a run_id (uuid) that is opened
+    in the *before* callback and closed in the *after* callback.
 
-Password
+    For SHARED tools the owning agent is captured via `tool_context.agent_name`
+    inside the before-tool callback, so two agents calling the same tool
+    produce two separate log entries under two different graph nodes.
+    """
 
-Full name
+    def __init__(self, root_agent):
+        self.graph = extract_agent_graph(root_agent)
+        # Temporary store for open (started but not finished) executions
+        # key: run_id  →  {"start": float, "node_path": [...]}
+        self._pending: dict[str, dict] = {}
 
-The system must:
+    # ── internal graph navigation ──────────────────────────────────────────
 
-Ensure email uniqueness.
+    def _find_agent_node(self, agent_name: str, node=None) -> dict | None:
+        """Walk the graph tree to find a node by agent name."""
+        if node is None:
+            node = self.graph
+        if node["name"] == agent_name:
+            return node
+        for child in node["sub_agents"]:
+            result = self._find_agent_node(agent_name, child)
+            if result:
+                return result
+        return None
 
-Hash passwords before storing them in the database.
+    # ── agent callbacks ────────────────────────────────────────────────────
 
-Create users with:
+    def before_agent(self, callback_context) -> None:
+        agent_name = callback_context.agent_name
+        run_id = str(uuid.uuid4())
 
-is_active = true
+        # Stash run_id on the context so after_agent can retrieve it
+        callback_context.state["__run_id__"] = run_id
 
-is_verified = false (default)
+        self._pending[run_id] = {
+            "start": time.perf_counter(),
+            "type": "agent",
+            "agent_name": agent_name,
+        }
 
-After signup:
+    def after_agent(self, callback_context) -> None:
+        run_id = callback_context.state.get("__run_id__")
+        if not run_id or run_id not in self._pending:
+            return
 
-The user cannot log in until verified by an admin.
+        entry = self._pending.pop(run_id)
+        duration = time.perf_counter() - entry["start"]
+        agent_name = entry["agent_name"]
 
-The API should return a success message indicating that verification is pending.
+        node = self._find_agent_node(agent_name)
+        if node:
+            node["execution_log"].append({
+                "run_id": run_id,
+                "start_s": entry["start"],
+                "duration_s": round(duration, 4),
+            })
 
-2.2 Admin Verification
+    # ── tool callbacks ─────────────────────────────────────────────────────
 
-Only an administrator can set:
+    def before_tool(self, tool, args, tool_context) -> None:
+        tool_name = getattr(tool, "name", getattr(tool, "__name__", type(tool).__name__))
+        # ★ KEY: tool_context.agent_name tells us WHICH agent is calling this tool
+        calling_agent = tool_context.agent_name
+        run_id = str(uuid.uuid4())
 
-is_verified = true
+        # Attach run_id to args dict so after_tool can read it
+        # (ADK passes the same args dict to after_tool)
+        args["__tool_run_id__"] = run_id
 
-Users must not be able to log in if:
+        self._pending[run_id] = {
+            "start": time.perf_counter(),
+            "type": "tool",
+            "tool_name": tool_name,
+            "calling_agent": calling_agent,   # ← pinpoints shared-tool caller
+            "args_snapshot": {k: v for k, v in args.items()
+                               if not k.startswith("__")},
+        }
 
-is_verified = false
+    def after_tool(self, tool, args, tool_context, tool_response) -> None:
+        run_id = args.pop("__tool_run_id__", None)
+        if not run_id or run_id not in self._pending:
+            return
 
-is_active = false
+        entry = self._pending.pop(run_id)
+        duration = time.perf_counter() - entry["start"]
+        tool_name = entry["tool_name"]
+        calling_agent = entry["calling_agent"]
 
-Verification will be handled manually from the backend (admin-controlled).
+        # Navigate to the calling agent's node, then its tool entry
+        agent_node = self._find_agent_node(calling_agent)
+        if agent_node and tool_name in agent_node["tools"]:
+            agent_node["tools"][tool_name]["execution_log"].append({
+                "run_id": run_id,
+                "start_s": entry["start"],
+                "duration_s": round(duration, 4),
+                "args_snapshot": entry["args_snapshot"],
+                "success": "error" not in str(tool_response).lower(),
+            })
 
-2.3 Login
+    # ── output ─────────────────────────────────────────────────────────────
 
-Users authenticate using:
+    def dump(self, indent=2) -> str:
+        return json.dumps(self.graph, indent=indent)
 
-Email
+    def summary(self) -> dict:
+        """Flat summary: agent/tool → total calls + avg duration."""
+        results = defaultdict(lambda: {"calls": 0, "total_s": 0.0})
+        self._summarize_node(self.graph, results)
+        return {k: {**v, "avg_s": round(v["total_s"] / v["calls"], 4)}
+                for k, v in results.items()}
 
-Password
-
-The system must:
-
-Validate credentials.
-
-Reject login if:
-
-User does not exist.
-
-Password is incorrect.
-
-is_active = false
-
-is_verified = false
-
-On successful authentication:
-
-Generate:
-
-Short-lived Access Token
-
-Long-lived Refresh Token
-
-Store both tokens in HttpOnly cookies.
-
-2.4 Access to Protected Endpoints
-
-Protected APIs must:
-
-Require a valid access token.
-
-Extract user identity from the JWT.
-
-Deny access if token is invalid or expired.
-
-Tokens must be automatically included by the browser via cookies.
-
-2.5 Token Refresh
-
-If the access token expires:
-
-The client calls a refresh endpoint.
-
-The refresh token is validated.
-
-A new access token is issued.
-
-The access token cookie is replaced.
-
-2.6 Logout
-
-Logout endpoint must:
-
-Clear access token cookie.
-
-Clear refresh token cookie.
-
-After logout:
-
-The user must not be able to access protected routes.
+    def _summarize_node(self, node, results):
+        key = f"[agent] {node['name']}"
+        for e in node["execution_log"]:
+            results[key]["calls"] += 1
+            results[key]["total_s"] += e["duration_s"]
+        for tool_name, tool_data in node["tools"].items():
+            # Scope the tool key to the owning agent to distinguish shared tools
+            tkey = f"[tool]  {node['name']} → {tool_name}"
+            for e in tool_data["execution_log"]:
+                results[tkey]["calls"] += 1
+                results[tkey]["total_s"] += e["duration_s"]
+        for child in node["sub_agents"]:
+            self._summarize_node(child, results)
