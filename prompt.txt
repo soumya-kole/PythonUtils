@@ -1,174 +1,440 @@
-import json
-import time
-import uuid
-from collections import defaultdict
-from google.adk.agents import LlmAgent
-from google.adk.tools import BaseTool
+# CVS FastAPI Authentication System
+## Technical Requirements & Design Document
 
-# ──────────────────────────────────────────────
-# 1. ENHANCED GRAPH with execution_log per node
-# ──────────────────────────────────────────────
+| | |
+|---|---|
+| **Version** | 1.0.0 |
+| **Date** | March 2026 |
+| **Status** | Draft — For Review |
 
-def extract_agent_graph(agent):
-    """Recursively traverses an ADK Agent to build a graph dictionary."""
-    graph_node = {
-        "name": agent.name,
-        "type": agent.__class__.__name__,
-        "description": agent.description,
-        "tools": {},       # tool_name -> { meta + execution_log[] }
-        "sub_agents": [],
-        "execution_log": []  # [{run_id, start, end, duration}]
-    }
+---
 
-    if getattr(agent, "tools", None):
-        for tool in agent.tools:
-            tool_name = getattr(tool, "name", getattr(tool, "__name__", type(tool).__name__))
-            graph_node["tools"][tool_name] = {
-                "type": type(tool).__name__,
-                "execution_log": []   # [{run_id, start, end, duration, args_snapshot}]
-            }
+## Table of Contents
 
-    if getattr(agent, "sub_agents", None):
-        for sub_agent in agent.sub_agents:
-            graph_node["sub_agents"].append(extract_agent_graph(sub_agent))
+1. [Overview](#1-overview)
+2. [Functional Requirements](#2-functional-requirements)
+3. [User Account State Machine](#3-user-account-state-machine)
+4. [API Endpoint Design](#4-api-endpoint-design)
+5. [Database Design (PostgreSQL)](#5-database-design-postgresql)
+6. [Security Architecture](#6-security-architecture)
+7. [Technology Stack](#7-technology-stack)
+8. [Proposed Project Structure](#8-proposed-project-structure)
+9. [Open Questions & Decisions Required](#9-open-questions--decisions-required)
+10. [Revision History](#10-revision-history)
 
-    return graph_node
+---
 
+## 1. Overview
 
-# ──────────────────────────────────────────────
-# 2. TRACKER — owns the graph + pending timers
-# ──────────────────────────────────────────────
+This document captures the functional requirements, API design, database schema, and security architecture for a custom authentication system built with FastAPI. The system enforces a **two-gate approval workflow** specific to CVS corporate email accounts: new users must verify their email address and separately receive approval from a designated administrator before gaining access.
 
-class ExecutionTracker:
-    """
-    Stores the agent graph and records timing for every agent/tool execution.
+The design prioritizes security through password hashing, JWT-based session tokens, and short-lived one-time verification codes distributed via email.
 
-    Identity strategy
-    -----------------
-    Each execution is uniquely identified by a run_id (uuid) that is opened
-    in the *before* callback and closed in the *after* callback.
+---
 
-    For SHARED tools the owning agent is captured via `tool_context.agent_name`
-    inside the before-tool callback, so two agents calling the same tool
-    produce two separate log entries under two different graph nodes.
-    """
+## 2. Functional Requirements
 
-    def __init__(self, root_agent):
-        self.graph = extract_agent_graph(root_agent)
-        # Temporary store for open (started but not finished) executions
-        # key: run_id  →  {"start": float, "node_path": [...]}
-        self._pending: dict[str, dict] = {}
+### 2.1 Sign-Up Flow
 
-    # ── internal graph navigation ──────────────────────────────────────────
+#### REQ-S01: Email Domain Validation
+Only CVS corporate email addresses (ending in `@cvs.com`) are accepted for registration. Any other domain must be rejected with a clear error message at the point of submission.
 
-    def _find_agent_node(self, agent_name: str, node=None) -> dict | None:
-        """Walk the graph tree to find a node by agent name."""
-        if node is None:
-            node = self.graph
-        if node["name"] == agent_name:
-            return node
-        for child in node["sub_agents"]:
-            result = self._find_agent_node(agent_name, child)
-            if result:
-                return result
-        return None
+#### REQ-S02: Duplicate Account Prevention
+Before creating a new record, the system must check whether the submitted email address already exists in the database. If a record is found, the API returns a conflict error and no new record is created.
 
-    # ── agent callbacks ────────────────────────────────────────────────────
+#### REQ-S03: Secure Password Storage
+Passwords must never be stored in plain text. Upon successful registration, the password is hashed using **bcrypt** (work factor ≥ 12) before being persisted to the database.
 
-    def before_agent(self, callback_context) -> None:
-        agent_name = callback_context.agent_name
-        run_id = str(uuid.uuid4())
+#### REQ-S04: Dual Verification Code Generation
+On successful registration, the system generates two independent, cryptographically random verification tokens:
 
-        # Stash run_id on the context so after_agent can retrieve it
-        callback_context.state["__run_id__"] = run_id
+- A **user verification token** sent to the registering user's email.
+- An **admin approval token** sent to a pre-configured administrator email address.
+- Both tokens must be unique, URL-safe, and carry a defined expiry (recommended: **24 hours**).
 
-        self._pending[run_id] = {
-            "start": time.perf_counter(),
-            "type": "agent",
-            "agent_name": agent_name,
-        }
+#### REQ-S05: Verification Email Content
+Each verification email must contain a clickable URL in the format:
 
-    def after_agent(self, callback_context) -> None:
-        run_id = callback_context.state.get("__run_id__")
-        if not run_id or run_id not in self._pending:
-            return
+```
+GET /api/v1/auth/verify/{token}
+```
 
-        entry = self._pending.pop(run_id)
-        duration = time.perf_counter() - entry["start"]
-        agent_name = entry["agent_name"]
+Clicking the URL triggers the corresponding status change for that token type (email verified or admin approved).
 
-        node = self._find_agent_node(agent_name)
-        if node:
-            node["execution_log"].append({
-                "run_id": run_id,
-                "start_s": entry["start"],
-                "duration_s": round(duration, 4),
-            })
+#### REQ-S06: Email Verification Status Change
+When a user clicks their verification link, the system must:
 
-    # ── tool callbacks ─────────────────────────────────────────────────────
+1. Validate the token exists and has not expired.
+2. Update the user's `email_verified` flag to `TRUE`.
+3. Invalidate the token so it cannot be reused.
 
-    def before_tool(self, tool, args, tool_context) -> None:
-        tool_name = getattr(tool, "name", getattr(tool, "__name__", type(tool).__name__))
-        # ★ KEY: tool_context.agent_name tells us WHICH agent is calling this tool
-        calling_agent = tool_context.agent_name
-        run_id = str(uuid.uuid4())
+#### REQ-S07: Admin Approval Status Change
+When the admin clicks their approval link, the system must:
 
-        # Attach run_id to args dict so after_tool can read it
-        # (ADK passes the same args dict to after_tool)
-        args["__tool_run_id__"] = run_id
+1. Validate the token exists and has not expired.
+2. Update the user's `admin_approved` flag to `TRUE`.
+3. Invalidate the token so it cannot be reused.
 
-        self._pending[run_id] = {
-            "start": time.perf_counter(),
-            "type": "tool",
-            "tool_name": tool_name,
-            "calling_agent": calling_agent,   # ← pinpoints shared-tool caller
-            "args_snapshot": {k: v for k, v in args.items()
-                               if not k.startswith("__")},
-        }
+---
 
-    def after_tool(self, tool, args, tool_context, tool_response) -> None:
-        run_id = args.pop("__tool_run_id__", None)
-        if not run_id or run_id not in self._pending:
-            return
+### 2.2 Sign-In Flow
 
-        entry = self._pending.pop(run_id)
-        duration = time.perf_counter() - entry["start"]
-        tool_name = entry["tool_name"]
-        calling_agent = entry["calling_agent"]
+#### REQ-L01: Prerequisite Gating
+A user may only sign in if **both** conditions are met:
 
-        # Navigate to the calling agent's node, then its tool entry
-        agent_node = self._find_agent_node(calling_agent)
-        if agent_node and tool_name in agent_node["tools"]:
-            agent_node["tools"][tool_name]["execution_log"].append({
-                "run_id": run_id,
-                "start_s": entry["start"],
-                "duration_s": round(duration, 4),
-                "args_snapshot": entry["args_snapshot"],
-                "success": "error" not in str(tool_response).lower(),
-            })
+- Their email address has been verified (`email_verified = TRUE`).
+- Their account has been approved by an administrator (`admin_approved = TRUE`).
 
-    # ── output ─────────────────────────────────────────────────────────────
+Any attempt to sign in before both gates are cleared must return an informative `403 Forbidden` response indicating which condition is unmet.
 
-    def dump(self, indent=2) -> str:
-        return json.dumps(self.graph, indent=indent)
+#### REQ-L02: Credential Validation
+The system must verify the submitted password against the stored bcrypt hash. An incorrect password returns a `401 Unauthorized` response.
 
-    def summary(self) -> dict:
-        """Flat summary: agent/tool → total calls + avg duration."""
-        results = defaultdict(lambda: {"calls": 0, "total_s": 0.0})
-        self._summarize_node(self.graph, results)
-        return {k: {**v, "avg_s": round(v["total_s"] / v["calls"], 4)}
-                for k, v in results.items()}
+#### REQ-L03: JWT Token Issuance
+Upon successful login, the system issues a signed JWT containing:
 
-    def _summarize_node(self, node, results):
-        key = f"[agent] {node['name']}"
-        for e in node["execution_log"]:
-            results[key]["calls"] += 1
-            results[key]["total_s"] += e["duration_s"]
-        for tool_name, tool_data in node["tools"].items():
-            # Scope the tool key to the owning agent to distinguish shared tools
-            tkey = f"[tool]  {node['name']} → {tool_name}"
-            for e in tool_data["execution_log"]:
-                results[tkey]["calls"] += 1
-                results[tkey]["total_s"] += e["duration_s"]
-        for child in node["sub_agents"]:
-            self._summarize_node(child, results)
+| Claim | Value |
+|---|---|
+| `sub` | User's email or UUID |
+| `exp` | Short-lived expiry (e.g., 1 hour) |
+| `iat` | Timestamp of issuance |
+| `role` | User role for authorization (`user` / `admin`) |
+
+#### REQ-L04: Cookie-Based Token Delivery
+For browser-based frontends, the JWT access token is set as an `HttpOnly`, `Secure`, `SameSite=Lax` cookie on the response. This prevents JavaScript-based XSS access to the token.
+
+#### REQ-L05: Protected Endpoint Authorization
+All endpoints beyond the auth flow require a valid JWT. The token can be supplied either via the HttpOnly cookie (browser clients) or the `Authorization: Bearer` header (API clients). An expired or invalid token returns a `401` response.
+
+---
+
+## 3. User Account State Machine
+
+A user account progresses through the following states from registration to full access:
+
+| State | `email_verified` | `admin_approved` | Description |
+|---|:---:|:---:|---|
+| `PENDING` | `false` | `false` | Account just created; no actions taken. |
+| `EMAIL_VERIFIED` | `true` | `false` | User clicked their email link; awaiting admin. |
+| `ADMIN_APPROVED` | `false` | `true` | Admin approved before user verified email. |
+| `ACTIVE` | `true` | `true` | Fully active; sign-in is permitted. |
+| `DISABLED` | — | — | Account manually disabled by an admin. |
+
+> **Note:** `EMAIL_VERIFIED` and `ADMIN_APPROVED` are independent states. Either can complete first. Sign-in is only granted when both flags are `TRUE` (the `ACTIVE` state).
+
+```
+[Registration]
+      │
+      ▼
+  PENDING ──── user clicks link ────► EMAIL_VERIFIED
+      │                                     │
+      │                                     │
+      └──── admin clicks link ───► ADMIN_APPROVED
+                                            │
+                             (both true) ───▼
+                                         ACTIVE ──► DISABLED
+```
+
+---
+
+## 4. API Endpoint Design
+
+All endpoints are prefixed with `/api/v1`. Auth endpoints live under `/auth`; protected resources are grouped separately.
+
+### 4.1 Public Endpoints (No Auth Required)
+
+---
+
+#### `POST /api/v1/auth/signup`
+
+Register a new CVS user. Validates domain, hashes password, creates user record, generates tokens, and sends verification emails.
+
+**Request Body**
+```json
+{
+  "email": "user@cvs.com",
+  "password": "SecurePass123!"
+}
+```
+
+**Response — 201 Created**
+```json
+{
+  "message": "Registration successful. Please check your email to verify your account."
+}
+```
+
+**Error Responses**
+
+| Code | Reason |
+|---|---|
+| `400 Bad Request` | Invalid email domain or password does not meet policy. |
+| `409 Conflict` | Email address already registered. |
+
+---
+
+#### `GET /api/v1/auth/verify/{token}`
+
+Unified verification endpoint consumed by both user email links and admin approval links. The token type (`email_verify` vs `admin_approve`) is resolved server-side from the token record.
+
+**URL Parameter:** `token` — the unique random string from the email link.
+
+**Response — 200 OK**
+```json
+{
+  "message": "Email verified successfully." 
+}
+```
+
+**Error Responses**
+
+| Code | Reason |
+|---|---|
+| `400 Bad Request` | Token has expired. |
+| `404 Not Found` | Token not found or already consumed. |
+
+---
+
+#### `POST /api/v1/auth/signin`
+
+Authenticate a fully-verified and approved user. Returns a signed JWT and sets it as an HttpOnly cookie for browser clients.
+
+**Request Body**
+```json
+{
+  "email": "user@cvs.com",
+  "password": "SecurePass123!"
+}
+```
+
+**Response — 200 OK** *(cookie also set: `access_token`, HttpOnly, Secure, SameSite=Lax)*
+```json
+{
+  "access_token": "<jwt>",
+  "token_type": "bearer",
+  "expires_in": 3600
+}
+```
+
+**Error Responses**
+
+| Code | Reason |
+|---|---|
+| `401 Unauthorized` | Invalid credentials. |
+| `403 Forbidden` | Email not verified, or account not yet admin-approved. |
+
+---
+
+#### `POST /api/v1/auth/signout`
+
+Clears the HttpOnly session cookie on the client. The JWT remains cryptographically valid until its `exp` claim (stateless design).
+
+**Response — 200 OK**
+```json
+{ "message": "Signed out successfully." }
+```
+
+---
+
+### 4.2 Protected Endpoints (JWT Required)
+
+All routes below require a valid JWT via cookie or `Authorization: Bearer` header. A FastAPI dependency `get_current_user` handles extraction and validation.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/users/me` | Return the authenticated user's profile. |
+| `PATCH` | `/api/v1/users/me` | Update the authenticated user's profile. |
+| `GET` | `/api/v1/admin/users` | **Admin only:** list all registered users. |
+| `PATCH` | `/api/v1/admin/users/{id}` | **Admin only:** enable or disable an account. |
+
+---
+
+## 5. Database Design (PostgreSQL)
+
+The system uses PostgreSQL with two core tables. All timestamps are stored in UTC. UUIDs are used as primary keys to prevent enumeration attacks.
+
+### 5.1 Table: `users`
+
+Stores all registered user accounts and their current verification state.
+
+| Column | Type | Nullable | Default | Description |
+|---|---|:---:|---|---|
+| `id` | `UUID` | NO | `gen_random_uuid()` | Primary key. |
+| `email` | `VARCHAR(254)` | NO | — | CVS email. Unique index enforced at DB level. |
+| `hashed_password` | `VARCHAR(72)` | NO | — | bcrypt hash of the user's password. |
+| `email_verified` | `BOOLEAN` | NO | `FALSE` | Set to `TRUE` after user clicks their email link. |
+| `admin_approved` | `BOOLEAN` | NO | `FALSE` | Set to `TRUE` after admin clicks their approval link. |
+| `is_active` | `BOOLEAN` | NO | `TRUE` | `FALSE` disables the account manually. |
+| `role` | `VARCHAR(20)` | NO | `'user'` | Role for RBAC: `'user'` or `'admin'`. |
+| `created_at` | `TIMESTAMPTZ` | NO | `now()` | Account creation timestamp (UTC). |
+| `updated_at` | `TIMESTAMPTZ` | NO | `now()` | Last modification timestamp (UTC). |
+
+**DDL**
+```sql
+CREATE TABLE users (
+    id               UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    email            VARCHAR(254) NOT NULL UNIQUE,
+    hashed_password  VARCHAR(72)  NOT NULL,
+    email_verified   BOOLEAN      NOT NULL DEFAULT FALSE,
+    admin_approved   BOOLEAN      NOT NULL DEFAULT FALSE,
+    is_active        BOOLEAN      NOT NULL DEFAULT TRUE,
+    role             VARCHAR(20)  NOT NULL DEFAULT 'user',
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_users_email ON users (email);
+```
+
+---
+
+### 5.2 Table: `verification_tokens`
+
+Stores one-time tokens for email verification and admin approval. Each registration creates **two** records: one of type `email_verify` and one of type `admin_approve`.
+
+| Column | Type | Nullable | Default | Description |
+|---|---|:---:|---|---|
+| `id` | `UUID` | NO | `gen_random_uuid()` | Primary key. |
+| `user_id` | `UUID` | NO | — | FK → `users.id`. `ON DELETE CASCADE`. |
+| `token` | `VARCHAR(128)` | NO | — | Unique random token (`secrets.token_urlsafe`). |
+| `token_type` | `VARCHAR(20)` | NO | — | `'email_verify'` or `'admin_approve'`. |
+| `expires_at` | `TIMESTAMPTZ` | NO | — | Token expiry (e.g., `now() + interval '24 hours'`). |
+| `used_at` | `TIMESTAMPTZ` | YES | `NULL` | `NULL` until consumed; set on first use. |
+| `created_at` | `TIMESTAMPTZ` | NO | `now()` | Token generation timestamp. |
+
+**DDL**
+```sql
+CREATE TABLE verification_tokens (
+    id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token       VARCHAR(128) NOT NULL UNIQUE,
+    token_type  VARCHAR(20)  NOT NULL CHECK (token_type IN ('email_verify', 'admin_approve')),
+    expires_at  TIMESTAMPTZ  NOT NULL,
+    used_at     TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_tokens_token ON verification_tokens (token);
+CREATE INDEX idx_tokens_user  ON verification_tokens (user_id);
+```
+
+---
+
+### 5.3 Entity Relationship
+
+```
+users
+  id (PK) ◄────────────────────┐
+  email                         │
+  hashed_password               │ FK (ON DELETE CASCADE)
+  email_verified                │
+  admin_approved                │
+  is_active               verification_tokens
+  role                      id (PK)
+  created_at                user_id (FK) ──────────────┘
+  updated_at                token
+                            token_type  ['email_verify' | 'admin_approve']
+                            expires_at
+                            used_at
+                            created_at
+```
+
+One user → many verification tokens (two per registration; more if re-sent).
+
+---
+
+## 6. Security Architecture
+
+### 6.1 Password Security
+
+| Concern | Mitigation |
+|---|---|
+| Plain-text storage | bcrypt with work factor ≥ 12 via `passlib[bcrypt]`. |
+| Weak passwords | Enforce minimum 12 characters, mixed case, digit, and symbol at the Pydantic schema layer. |
+| Timing attacks | `passlib` uses constant-time comparison to prevent hash inference. |
+
+### 6.2 Token Security
+
+| Concern | Mitigation |
+|---|---|
+| Token guessing | 64-byte URL-safe random string via `secrets.token_urlsafe(64)`. |
+| Token reuse | `used_at` is set on first consumption; reuse is rejected. |
+| Expiry | Tokens expire after 24 hours; checked against `expires_at` column. |
+
+### 6.3 JWT Security
+
+| Concern | Mitigation |
+|---|---|
+| Token forgery | Signed with HS256 using a strong server secret (32+ byte random key stored in env vars). |
+| Token theft via XSS | Access token delivered via `HttpOnly` cookie; not accessible from JavaScript. |
+| CSRF attacks | `SameSite=Lax` cookie attribute blocks cross-site form submissions. |
+| Long-lived tokens | Short access token lifetime (1 hour). Refresh token pattern recommended for production. |
+
+---
+
+## 7. Technology Stack
+
+| Layer | Library / Tool | Purpose |
+|---|---|---|
+| Web Framework | FastAPI | API routing, request validation, OpenAPI docs. |
+| ORM | SQLAlchemy 2.x + asyncpg | Async database access and model definitions. |
+| Migrations | Alembic | Schema version control and migration scripts. |
+| Validation | Pydantic v2 | Request/response schema validation. |
+| Password Hashing | `passlib[bcrypt]` | bcrypt password hashing with automatic salting. |
+| JWT | `python-jose[cryptography]` | JWT creation, signing, and validation. |
+| Email | FastAPI-Mail / smtplib | SMTP email dispatch for verification links. |
+| Database | PostgreSQL 15+ | Primary relational data store. |
+| Containerisation | Docker + docker-compose | Local development and deployment packaging. |
+
+---
+
+## 8. Proposed Project Structure
+
+```
+project/
+├── app/
+│   ├── api/
+│   │   └── v1/
+│   │       ├── auth.py          # /signup, /signin, /verify, /signout
+│   │       ├── users.py         # /users/me
+│   │       └── admin.py         # /admin/users (admin-only)
+│   ├── core/
+│   │   ├── config.py            # Settings via pydantic-settings (.env)
+│   │   ├── security.py          # bcrypt helpers, JWT encode/decode
+│   │   └── email.py             # Email send helpers
+│   ├── db/
+│   │   ├── base.py              # SQLAlchemy async engine + session
+│   │   └── models.py            # ORM models: User, VerificationToken
+│   ├── schemas/
+│   │   ├── auth.py              # SignUpRequest, SignInRequest, TokenResponse
+│   │   └── user.py              # UserProfile, UserUpdate
+│   ├── dependencies.py          # get_current_user, require_admin
+│   └── main.py                  # FastAPI app init, router mounts, CORS
+├── alembic/                     # DB migration scripts
+├── tests/
+│   ├── test_auth.py
+│   └── test_users.py
+├── .env.example
+├── docker-compose.yml
+└── requirements.txt
+```
+
+---
+
+## 9. Open Questions & Decisions Required
+
+| # | Question | Options | Recommendation |
+|:---:|---|---|---|
+| 1 | Should expired tokens be automatically cleaned up? | Scheduled cron job vs. lazy deletion on access. | Scheduled cleanup via `pg_cron` or APScheduler to keep the table lean. |
+| 2 | How should token expiry failure be surfaced to the user? | Generic error page vs. re-send email button. | Provide a `/auth/resend-verification` endpoint with rate limiting. |
+| 3 | Do we need refresh tokens for long sessions? | Short-lived JWT only vs. access + refresh token pair. | Implement refresh tokens stored in a separate HttpOnly cookie for production. |
+| 4 | Single fixed admin email or multiple admin approvers? | Config-based single admin vs. admin role in `users` table. | Start with config-based; extend to role-based in v2. |
+| 5 | Rate limiting on signup and login endpoints? | Application-level (`slowapi`) vs. infrastructure (API gateway / WAF). | Add `slowapi` as a quick win; migrate to gateway for production deployments. |
+
+---
+
+## 10. Revision History
+
+| Version | Date | Author | Changes |
+|---|---|---|---|
+| 1.0.0 | March 2026 | — | Initial draft based on product requirements. |
