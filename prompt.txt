@@ -1,161 +1,269 @@
-# Async GCS Cache with Pattern Filtering for FastAPI
+This is the comment from the developer after improving it based on your input:
+any() instead of list comprehension in _determine_parent_and_scope✅ Correct micro-optimisationsetdefault instead of explicit if key not in dict✅ Cleaner, correct_last_traj_index.pop() on close✅ Correct — prevents a closed agent from accepting stale tool calls. The index is re-set when the next iteration opens, so nothing breaksif ref on _tool_index.pop()✅ Not a bug — (0, 0) is a non-empty tuple, which is truthy in PythonGenerator expression in level calculation✅ Negligible but correct
 
-## Overview
-Build a lightweight async TTL+LRU cache layer for a FastAPI app that reads files
-from GCS. Uses `cachetools.TTLCache` as the engine, adds asyncio thread-safety,
-per-key locking (thundering herd protection), and a decorator with fnmatch pattern
-filtering. No per-key TTL — single TTL set at cache construction time.
+Revised program
+-------------------
+import time
+import asyncio
+from typing import Dict, List, Any, Optional, Tuple
 
----
 
-## Project Structure
+class NestedHierarchyTracker:
+    """
+    Tracks agent/tool timing with correct parent-child relationships for
+    sequential, parallel, loop, and AgentTool execution patterns.
 
-app/
-├── cache/
-│   ├── __init__.py
-│   ├── async_cache.py      # AsyncTTLCache wrapper
-│   └── decorators.py       # @cached_gcs decorator
-├── services/
-│   └── gcs.py              # GCS fetch + decorated functions
-└── main.py                 # FastAPI app + /cache/stats endpoint
+    Lead's version adopted wholesale with one fix
+    ----------------------------------------------
+    The lead replaced the previous (inv_id, author, call_id) exact-match dict
+    with a call_id-only FIFO list, reasoning that responses may arrive
+    out-of-order and the same call_id can appear across iterations.
 
----
+    However the FIFO approach is ambiguous when two parallel agents in the
+    same invocation both issue a call with the same call_id — the FIFO list
+    contains both tool_keys and always pops the first one regardless of
+    which agent sent the response event.  ADK guarantees that a
+    function_response event carries the same author as the function_call
+    that produced it, so (inv_id, author, call_id) is always unambiguous
+    and covers the out-of-order / loop-reuse cases too.
 
-## Dependencies
+    Everything else in the lead's version is correct and kept:
+      - FIFO structure replaced with Dict[(inv_id, author, call_id) -> tool_key]
+      - _last_traj_index cleared on close (correct: prevents stale attachment)
+      - `if ref` on (i, j) tuple is fine — non-empty tuple is always truthy
+      - any() instead of list comprehension in _determine_parent_and_scope
+      - setdefault / generator patterns kept
+    """
 
-cachetools
-google-cloud-storage
-fastapi
-uvicorn
+    def __init__(self):
+        self.trajectory: List[Dict[str, Any]] = []
+        self.active_spans: Dict[str, Dict[str, Any]] = {}
+        self._loop_counts: Dict[str, int] = {}
+        self._context_stack: List[str] = []
+        self._scope_creator_sks: set = set()
+        self._pending_agent_calls: Dict[Tuple[str, str], str] = {}
+        self._sk_to_agent_key: Dict[str, str] = {}
+        self._span_index: Dict[str, int] = {}
+        self._tool_index: Dict[Tuple[str, str], Tuple[int, int]] = {}
 
----
+        # (inv_id, author, call_id) -> tool_key
+        # Three-part key is unambiguous even when parallel agents share call_id,
+        # because ADK delivers function_response on the same author that issued
+        # the function_call — so author+call_id together identify one in-flight tool.
+        self._call_id_to_tool_key: Dict[Tuple[str, str, str], str] = {}
 
-## 1. cache/async_cache.py
+        self._last_traj_index: Dict[str, int] = {}
+        self._children_of: Dict[str, set] = {}
+        self._lock = asyncio.Lock()
 
-Class: AsyncTTLCache
+    # ── Public API ─────────────────────────────────────────────────────────
 
-Constructor args:
-  - maxsize: int = 256        # max number of entries (LRU evicts oldest when full)
-  - ttl: int = 300            # seconds, applied uniformly to all entries
+    async def process_event(self, event) -> None:
+        async with self._lock:
+            self._handle_event(event)
 
-Internal state:
-  - self._cache = TTLCache(maxsize=maxsize, ttl=ttl)
-  - self._global_lock = asyncio.Lock()       # protects all _cache operations
-  - self._key_locks: dict[str, asyncio.Lock] = {}
-  - self._key_locks_lock = asyncio.Lock()    # protects the _key_locks dict itself
+    def finalize(self) -> List[Dict[str, Any]]:
+        end_perf = time.perf_counter()
+        for key in list(self.active_spans.keys()):
+            data = self.active_spans.pop(key)
+            if data["type"] == "tool":
+                self._set_tool_duration(
+                    data["span_key"], data["id"],
+                    round(end_perf - data["start_perf"], 3),
+                )
+                self._call_id_to_tool_key.pop(
+                    (data["inv_id"], data["author"], data["id"]), None
+                )
+            else:
+                self._set_agent_duration(
+                    data["span_key"],
+                    round(end_perf - data["start_perf"], 3),
+                )
+                self._cleanup_agent(data["span_key"])
+        return self.trajectory
 
-Methods:
+    # ── Core event handler ─────────────────────────────────────────────────
 
-  async get(key: str) -> Any | None
-    - acquire _global_lock
-    - return self._cache.get(key)
-    - cachetools returns None automatically for expired or missing keys
+    def _handle_event(self, event) -> None:
+        curr_perf = time.perf_counter()
+        curr_wall = time.time()
+        inv_id    = event.get("invocation_id")
+        author    = event.get("author")
+        if not inv_id or not author:
+            return
 
-  async set(key: str, value: Any) -> None
-    - acquire _global_lock
-    - self._cache[key] = value
+        agent_key = f"{inv_id}::{author}"
+        is_final  = bool(event.get("is_final"))
 
-  async get_key_lock(key: str) -> asyncio.Lock
-    - acquire _key_locks_lock
-    - create entry in _key_locks if not present
-    - return the lock for that key
+        # ── Step 1: CLOSE ──────────────────────────────────────────────────
+        if author != "user" and is_final:
+            data = self.active_spans.pop(agent_key, None)
+            if data:
+                sk = data["span_key"]
+                self._set_agent_duration(sk, round(curr_perf - data["start_perf"], 3))
+                self._cleanup_agent(sk)
 
-  def stats(self) -> dict
-    - return currsize, maxsize, ttl (no lock needed — read only)
+        # ── Step 2: OPEN ───────────────────────────────────────────────────
+        has_calls   = bool(event.get("function_calls"))
+        is_new_start = (
+            author != "user"
+            and agent_key not in self.active_spans
+            and (not is_final or has_calls)
+        )
 
----
+        if is_new_start:
+            iteration = self._loop_counts.get(agent_key, 0)
+            self._loop_counts[agent_key] = iteration + 1
+            sk = f"{inv_id}::{author}::{iteration}"
 
-## 2. cache/decorators.py
+            parent_sk, is_scope = self._determine_parent_and_scope(author, inv_id)
 
-Function: cached_gcs(cache, patterns, key_fn=None)
+            self.active_spans[agent_key] = {
+                "type": "agent", "start_perf": curr_perf, "span_key": sk,
+            }
+            self._context_stack.append(sk)
+            self._sk_to_agent_key[sk] = agent_key
 
-Args:
-  - cache: AsyncTTLCache instance
-  - patterns: list[str]         # fnmatch glob patterns e.g. ["*.pdf"]
-  - key_fn: Callable | None     # optional custom key builder
+            if is_scope:
+                self._scope_creator_sks.add(sk)
+                self._children_of[sk] = set()
 
-Returns a decorator that wraps an async function whose first positional
-argument is blob_path: str.
+            if parent_sk:
+                self._children_of.setdefault(parent_sk, set()).add(sk)
 
-Decorator logic (in order):
+            level = sum(1 for s in self._context_stack if s in self._scope_creator_sks)
+            if is_scope:
+                level -= 1
 
-  Step 1 — Pattern gate
-    if not any(fnmatch.fnmatch(blob_path, p) for p in patterns):
-        return await func(blob_path, *args, **kwargs)   # bypass cache entirely
+            label = author if iteration == 0 else f"{author}[loop {iteration}]"
+            entry = {
+                "type": "agent", "span_key": sk, "inv_id": inv_id, "author": author,
+                "parent_key": parent_sk, "name": label, "start_time": curr_wall,
+                "duration": None, "tools": [], "level": level,
+            }
+            idx = len(self.trajectory)
+            self._span_index[sk]             = idx
+            self._last_traj_index[agent_key] = idx
+            self.trajectory.append(entry)
 
-  Step 2 — Build cache key
-    if key_fn provided: key = key_fn(blob_path, *args, **kwargs)
-    else: sha256 of f"{func.__name__}:{blob_path}:{args}:{sorted(kwargs.items())}"
+        # ── Step 3: TOOL CALLS ─────────────────────────────────────────────
+        for call in event.get("function_calls", []):
+            agent_data = self.active_spans.get(agent_key)
+            current_sk = agent_data["span_key"] if agent_data else f"{agent_key}::?"
+            tool_key   = f"tool::{current_sk}::{call['id']}"
 
-  Step 3 — Fast path check (no lock)
-    cached = await cache.get(key)
-    if cached: return cached
+            self.active_spans[tool_key] = {
+                "type": "tool", "start_perf": curr_perf,
+                "id": call["id"], "span_key": current_sk,
+                "inv_id": inv_id, "author": author,
+            }
+            self._call_id_to_tool_key[(inv_id, author, call["id"])] = tool_key
 
-  Step 4 — Acquire per-key lock
-    key_lock = await cache.get_key_lock(key)
-    async with key_lock:
-        cached = await cache.get(key)     # double-check after acquiring
-        if cached: return cached
+            traj_idx = self._last_traj_index.get(agent_key)
+            if traj_idx is not None:
+                entry = self.trajectory[traj_idx]
+                entry["tools"].append({
+                    "id": call["id"], "name": call["name"],
+                    "start_time": curr_wall, "duration": None,
+                })
+                self._tool_index[(current_sk, call["id"])] = (
+                    traj_idx, len(entry["tools"]) - 1,
+                )
 
-        result = await func(blob_path, *args, **kwargs)
-        if result is not None:
-            await cache.set(key, result)
-        return result
+            if agent_data:
+                self._pending_agent_calls[(inv_id, call["name"])] = agent_data["span_key"]
 
-Use @functools.wraps(func) on the wrapper.
-Log cache HIT / MISS / bypass at DEBUG / INFO level using logging.getLogger(__name__).
+        # ── Step 4: TOOL RESPONSES ─────────────────────────────────────────
+        for resp in event.get("function_responses", []):
+            tool_key = self._call_id_to_tool_key.pop((inv_id, author, resp["id"]), None)
+            if tool_key:
+                data = self.active_spans.pop(tool_key, None)
+                if data:
+                    self._set_tool_duration(
+                        data["span_key"], resp["id"],
+                        round(curr_perf - data["start_perf"], 3),
+                    )
 
----
+    # ── Parent / scope logic ───────────────────────────────────────────────
 
-## 3. services/gcs.py
+    def _determine_parent_and_scope(
+        self, author: str, inv_id: str
+    ) -> Tuple[Optional[str], bool]:
+        key = (inv_id, author)
+        if key in self._pending_agent_calls:
+            return self._pending_agent_calls.pop(key), True
 
-- Instantiate one module-level AsyncTTLCache:
-    gcs_cache = AsyncTTLCache(maxsize=256, ttl=600)
+        if not any(v["type"] == "agent" for v in self.active_spans.values()):
+            return None, True
 
-- Define fetch_file(blob_path: str) -> bytes
-  decorated with @cached_gcs(cache=gcs_cache, patterns=["*.pdf", "contracts/*.pdf"])
-  body: use google.cloud.storage.Client to download blob as bytes
-  function must be async — wrap sync GCS call with asyncio.get_event_loop().run_in_executor
-  or use a module-level ThreadPoolExecutor
+        for candidate in reversed(self._context_stack):
+            if candidate in self._scope_creator_sks:
+                return candidate, False
 
----
+        closed_scopes = self._scope_creator_sks - set(self._context_stack)
+        if closed_scopes:
+            best = max(closed_scopes, key=lambda sk: self._span_index.get(sk, -1))
+            return best, False
 
-## 4. main.py
+        return None, False
 
-- FastAPI app, no lifespan needed (no background tasks — cachetools evicts lazily)
-- GET /file/{blob_path:path}  →  calls fetch_file, returns {"size_bytes": int}
-- GET /cache/stats            →  returns gcs_cache.stats()
+    # ── Duration setters ──────────────────────────────────────────────────
 
----
+    def _set_agent_duration(self, span_key: str, duration: float) -> None:
+        idx = self._span_index.get(span_key)
+        if idx is not None:
+            self.trajectory[idx]["duration"] = duration
 
-## Behaviour Notes (important for correctness)
+    def _set_tool_duration(self, span_key: str, call_id: str, duration: float) -> None:
+        ref = self._tool_index.pop((span_key, call_id), None)
+        if ref:
+            i, j = ref
+            self.trajectory[i]["tools"][j]["duration"] = duration
 
-- No per-key TTL. TTL is set once at AsyncTTLCache construction. Do not add _TTLEntry
-  wrappers or any manual expiry tracking — cachetools handles it entirely.
+    # ── Agent cleanup ─────────────────────────────────────────────────────
 
-- Thread safety: cachetools.TTLCache is NOT thread-safe. Every read and write must
-  be inside async with self._global_lock. No exceptions.
+    def _cleanup_agent(self, sk: str) -> None:
+        try:
+            self._context_stack.remove(sk)
+        except ValueError:
+            pass
 
-- Thundering herd: the per-key lock ensures only ONE coroutine fetches from GCS on
-  a cache miss. All other coroutines waiting on the same key will hit the cache after
-  the lock is released. This requires the double-check pattern inside the lock (shown
-  in Step 4 above).
+        agent_key = self._sk_to_agent_key.get(sk)
+        if agent_key:
+            self._last_traj_index.pop(agent_key, None)
 
-- Pattern matching uses fnmatch.fnmatch — glob syntax, case-sensitive on Linux.
-  Patterns are evaluated with any(), first match wins, no priority ordering.
+        if sk in self._scope_creator_sks:
+            active_sks = {
+                v["span_key"] for v in self.active_spans.values()
+                if v["type"] == "agent"
+            }
+            if not (self._children_of.get(sk, set()) & active_sks):
+                self._scope_creator_sks.discard(sk)
+                self._children_of.pop(sk, None)
 
-- The _key_locks dict grows unboundedly over time (one lock per unique key ever
-  seen). This is acceptable for GCS blob paths which are finite and known.
-  Do not add cleanup logic unless explicitly asked.
+        for parent_sk, child_set in list(self._children_of.items()):
+            if sk in child_set:
+                child_set.discard(sk)
+                parent_agent_key = self._sk_to_agent_key.get(parent_sk)
+                parent_closed = (
+                    not parent_agent_key
+                    or parent_agent_key not in self.active_spans
+                )
+                if (parent_sk in self._scope_creator_sks
+                        and parent_closed and not child_set):
+                    self._scope_creator_sks.discard(parent_sk)
+                    self._children_of.pop(parent_sk, None)
+                break
 
-- GCS client should be a module-level singleton, not instantiated per request.
+        self._sk_to_agent_key.pop(sk, None)
 
----
+    # ── Pretty print ──────────────────────────────────────────────────────
 
-## Do Not
-
-- Do not add a background eviction sweep — cachetools handles lazy eviction
-- Do not add per-key TTL support
-- Do not use redis, diskcache, or any external cache store
-- Do not use threading.Lock — use asyncio.Lock throughout
-- Do not use lru_cache or functools.cache — they are not async-safe
+    def print_summary(self) -> None:
+        for item in self.trajectory:
+            indent = "  " * item.get("level", 0)
+            dur    = f"{item['duration']}s" if item["duration"] is not None else "n/a"
+            print(f"{indent}Agent: {item['name']}  dur={dur}")
+            for t in item.get("tools", []):
+                tdur = f"{t['duration']}s" if t["duration"] is not None else "n/a"
+                print(f"{indent}  └── Tool: {t['name']}  dur={tdur}")
