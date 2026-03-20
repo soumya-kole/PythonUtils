@@ -1,269 +1,279 @@
-This is the comment from the developer after improving it based on your input:
-any() instead of list comprehension in _determine_parent_and_scope✅ Correct micro-optimisationsetdefault instead of explicit if key not in dict✅ Cleaner, correct_last_traj_index.pop() on close✅ Correct — prevents a closed agent from accepting stale tool calls. The index is re-set when the next iteration opens, so nothing breaksif ref on _tool_index.pop()✅ Not a bug — (0, 0) is a non-empty tuple, which is truthy in PythonGenerator expression in level calculation✅ Negligible but correct
+# Prompt Management Service — Architecture & UI Flow
 
-Revised program
--------------------
-import time
-import asyncio
-from typing import Dict, List, Any, Optional, Tuple
+## System Architecture
 
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                          GKE Cluster                                  │
+│                                                                        │
+│   ┌─────────────────────────────────────────────────────────────┐    │
+│   │  prompt-service  (2–10 pods, HPA)                           │    │
+│   │                                                              │    │
+│   │   ┌──────────────────────────────────────────────────────┐  │    │
+│   │   │  FastAPI  (uvicorn, single worker per pod)            │  │    │
+│   │   │                                                        │  │    │
+│   │   │  GET /prompts/{agent}  ──►  In-Memory Cache           │  │    │
+│   │   │                              (dict, no TTL)            │  │    │
+│   │   │                                │                       │  │    │
+│   │   │                         Hit ◄──┤──► Miss               │  │    │
+│   │   │                          │         │                   │  │    │
+│   │   │                    return O(1)    fetch GCS            │  │    │
+│   │   │                                   store in cache       │  │    │
+│   │   │                                   return               │  │    │
+│   │   │                                                        │  │    │
+│   │   │  PUT /prompts/{agent}                                  │  │    │
+│   │   │       │                                                │  │    │
+│   │   │       ├─► 1. Write to GCS   (source of truth)         │  │    │
+│   │   │       └─► 2. cache.set(doc) (write-through — O(1))    │  │    │
+│   │   │                Cache is now consistent. No poll.       │  │    │
+│   │   └──────────────────────────────────────────────────────┘  │    │
+│   └─────────────────────────────────────────────────────────────┘    │
+│                              │  Workload Identity                      │
+│                              ▼                                         │
+│                 ┌────────────────────────┐                             │
+│                 │  Google Cloud Storage  │                             │
+│                 │                        │                             │
+│                 │  prompts/              │                             │
+│                 │  ├─ researcher/        │                             │
+│                 │  │  ├─ latest.json  ◄──┼── always current           │
+│                 │  │  ├─ v1.json         │   immutable snapshots       │
+│                 │  │  └─ v2.json         │                             │
+│                 │  └─ summarizer/        │                             │
+│                 │     ├─ latest.json     │                             │
+│                 │     └─ v1.json         │                             │
+│                 └────────────────────────┘                             │
+└──────────────────────────────────────────────────────────────────────┘
 
-class NestedHierarchyTracker:
-    """
-    Tracks agent/tool timing with correct parent-child relationships for
-    sequential, parallel, loop, and AgentTool execution patterns.
+Consumers (ADK agents, services)
+    └── GET /prompts/{agent_name}  →  prompt string  (always memory read)
+```
 
-    Lead's version adopted wholesale with one fix
-    ----------------------------------------------
-    The lead replaced the previous (inv_id, author, call_id) exact-match dict
-    with a call_id-only FIFO list, reasoning that responses may arrive
-    out-of-order and the same call_id can appear across iterations.
+---
 
-    However the FIFO approach is ambiguous when two parallel agents in the
-    same invocation both issue a call with the same call_id — the FIFO list
-    contains both tool_keys and always pops the first one regardless of
-    which agent sent the response event.  ADK guarantees that a
-    function_response event carries the same author as the function_call
-    that produced it, so (inv_id, author, call_id) is always unambiguous
-    and covers the out-of-order / loop-reuse cases too.
+## Cache Strategy — Write-Through, No TTL
 
-    Everything else in the lead's version is correct and kept:
-      - FIFO structure replaced with Dict[(inv_id, author, call_id) -> tool_key]
-      - _last_traj_index cleared on close (correct: prevents stale attachment)
-      - `if ref` on (i, j) tuple is fine — non-empty tuple is always truthy
-      - any() instead of list comprehension in _determine_parent_and_scope
-      - setdefault / generator patterns kept
-    """
+```
+                      ┌─────────────────────────────────────────┐
+                      │  When is the cache updated?              │
+                      │                                          │
+                      │  ✅ Startup warm   — every existing     │
+                      │     GCS prompt is pre-loaded.            │
+                      │                                          │
+                      │  ✅ PUT /prompts   — GCS write returns   │
+                      │     the doc; that exact object is        │
+                      │     stored in cache atomically.          │
+                      │     Zero latency, zero GCS re-read.      │
+                      │                                          │
+                      │  ✅ POST /rollback — same as above.      │
+                      │                                          │
+                      │  ✅ Cold miss      — first GET for a     │
+                      │     brand-new agent fetches GCS once     │
+                      │     and caches permanently.              │
+                      │                                          │
+                      │  ✅ Manual refresh — escape hatch for    │
+                      │     direct GCS edits outside the service.│
+                      │                                          │
+                      │  ❌ Time           — entries NEVER       │
+                      │     expire by time. No TTL, no poll.     │
+                      └─────────────────────────────────────────┘
 
-    def __init__(self):
-        self.trajectory: List[Dict[str, Any]] = []
-        self.active_spans: Dict[str, Dict[str, Any]] = {}
-        self._loop_counts: Dict[str, int] = {}
-        self._context_stack: List[str] = []
-        self._scope_creator_sks: set = set()
-        self._pending_agent_calls: Dict[Tuple[str, str], str] = {}
-        self._sk_to_agent_key: Dict[str, str] = {}
-        self._span_index: Dict[str, int] = {}
-        self._tool_index: Dict[Tuple[str, str], Tuple[int, int]] = {}
+Write path (PUT /prompts/{agent})
+─────────────────────────────────
+  Request
+    │
+    ├─► gcs_client.save(agent, content, author, note)
+    │         │
+    │         │   Writes  prompts/agent/v{N}.json  (immutable snapshot)
+    │         │   Writes  prompts/agent/latest.json (overwrites pointer)
+    │         │
+    │         └─► returns PromptDocument(version=N, content=..., ...)
+    │
+    └─► cache.set(agent, doc)     ← single dict assignment under asyncio.Lock
+              │
+              Cache now holds v{N}.  All subsequent GETs read from memory.
+              No window of staleness.  No background task needed.
 
-        # (inv_id, author, call_id) -> tool_key
-        # Three-part key is unambiguous even when parallel agents share call_id,
-        # because ADK delivers function_response on the same author that issued
-        # the function_call — so author+call_id together identify one in-flight tool.
-        self._call_id_to_tool_key: Dict[Tuple[str, str, str], str] = {}
+Read path (GET /prompts/{agent})
+─────────────────────────────────
+  Cache hit  → return _store[agent]                   O(1), no I/O
+  Cache miss → fetch GCS → store → return             one GCS read, then O(1) forever
+```
 
-        self._last_traj_index: Dict[str, int] = {}
-        self._children_of: Dict[str, set] = {}
-        self._lock = asyncio.Lock()
+---
 
-    # ── Public API ─────────────────────────────────────────────────────────
+## API Reference
 
-    async def process_event(self, event) -> None:
-        async with self._lock:
-            self._handle_event(event)
+| Method | Endpoint                          | Auth | Description                              |
+|--------|-----------------------------------|------|------------------------------------------|
+| GET    | `/health`                         | —    | Liveness / readiness probe               |
+| GET    | `/prompts`                        | —    | List all agent names (from GCS)          |
+| GET    | `/prompts/{agent}`                | —    | Get current prompt — always memory hit   |
+| PUT    | `/prompts/{agent}`                | ✓    | Save new version → write-through cache   |
+| DELETE | `/prompts/{agent}`                | ✓    | Delete all GCS versions + evict cache    |
+| GET    | `/prompts/{agent}/versions`       | —    | Full version history from GCS            |
+| GET    | `/prompts/{agent}/versions/{N}`   | —    | Retrieve a specific historical version   |
+| POST   | `/prompts/{agent}/rollback`       | ✓    | Promote old version as new latest        |
+| GET    | `/cache/stats`                    | —    | Show all cached agents and versions      |
+| POST   | `/cache/refresh`                  | ✓    | Re-fetch ALL agents from GCS (escape hatch) |
+| POST   | `/cache/refresh/{agent}`          | ✓    | Re-fetch one agent from GCS (escape hatch)  |
+| DELETE | `/cache`                          | ✓    | Clear entire cache (next GETs refill it) |
 
-    def finalize(self) -> List[Dict[str, Any]]:
-        end_perf = time.perf_counter()
-        for key in list(self.active_spans.keys()):
-            data = self.active_spans.pop(key)
-            if data["type"] == "tool":
-                self._set_tool_duration(
-                    data["span_key"], data["id"],
-                    round(end_perf - data["start_perf"], 3),
-                )
-                self._call_id_to_tool_key.pop(
-                    (data["inv_id"], data["author"], data["id"]), None
-                )
-            else:
-                self._set_agent_duration(
-                    data["span_key"],
-                    round(end_perf - data["start_perf"], 3),
-                )
-                self._cleanup_agent(data["span_key"])
-        return self.trajectory
+> The /cache/refresh endpoints exist only as an escape hatch for the rare
+> case where a GCS object is edited directly outside the service. Under normal
+> operation — all writes go through PUT /prompts/{agent} — they are never needed.
 
-    # ── Core event handler ─────────────────────────────────────────────────
+---
 
-    def _handle_event(self, event) -> None:
-        curr_perf = time.perf_counter()
-        curr_wall = time.time()
-        inv_id    = event.get("invocation_id")
-        author    = event.get("author")
-        if not inv_id or not author:
-            return
+## GCS Object Layout
 
-        agent_key = f"{inv_id}::{author}"
-        is_final  = bool(event.get("is_final"))
+```
+prompts/
+└── {agent_name}/
+    ├── latest.json     ← overwritten on every save; always current version
+    ├── v1.json         ← immutable — never modified after creation
+    ├── v2.json
+    └── v3.json
 
-        # ── Step 1: CLOSE ──────────────────────────────────────────────────
-        if author != "user" and is_final:
-            data = self.active_spans.pop(agent_key, None)
-            if data:
-                sk = data["span_key"]
-                self._set_agent_duration(sk, round(curr_perf - data["start_perf"], 3))
-                self._cleanup_agent(sk)
+Schema (every file):
+{
+  "agent_name":  "researcher",
+  "content":     "You are a research assistant...",
+  "version":     3,
+  "author":      "alice@company.com",
+  "change_note": "Improved grounding instruction",
+  "updated_at":  "2025-03-19T10:00:00Z"
+}
+```
 
-        # ── Step 2: OPEN ───────────────────────────────────────────────────
-        has_calls   = bool(event.get("function_calls"))
-        is_new_start = (
-            author != "user"
-            and agent_key not in self.active_spans
-            and (not is_final or has_calls)
-        )
+---
 
-        if is_new_start:
-            iteration = self._loop_counts.get(agent_key, 0)
-            self._loop_counts[agent_key] = iteration + 1
-            sk = f"{inv_id}::{author}::{iteration}"
+## Versioning & Rollback
 
-            parent_sk, is_scope = self._determine_parent_and_scope(author, inv_id)
+```
+Save v1:
+  GCS:  v1.json created  +  latest.json → v1 content
 
-            self.active_spans[agent_key] = {
-                "type": "agent", "start_perf": curr_perf, "span_key": sk,
-            }
-            self._context_stack.append(sk)
-            self._sk_to_agent_key[sk] = agent_key
+Save v2 (update):
+  GCS:  v2.json created  +  latest.json → v2 content
+  v1.json is UNTOUCHED — history preserved forever
 
-            if is_scope:
-                self._scope_creator_sks.add(sk)
-                self._children_of[sk] = set()
+Rollback to v1:
+  Reads  v1.json content
+  Writes v3.json (rollback content)  +  latest.json → v1 content
+  History: v1 → v2 → v3(rollback)   ← forward-only log, no gaps
+```
 
-            if parent_sk:
-                self._children_of.setdefault(parent_sk, set()).add(sk)
+---
 
-            level = sum(1 for s in self._context_stack if s in self._scope_creator_sks)
-            if is_scope:
-                level -= 1
+## UI Flow (React Admin Panel)
 
-            label = author if iteration == 0 else f"{author}[loop {iteration}]"
-            entry = {
-                "type": "agent", "span_key": sk, "inv_id": inv_id, "author": author,
-                "parent_key": parent_sk, "name": label, "start_time": curr_wall,
-                "duration": None, "tools": [], "level": level,
-            }
-            idx = len(self.trajectory)
-            self._span_index[sk]             = idx
-            self._last_traj_index[agent_key] = idx
-            self.trajectory.append(entry)
+### Screen 1 — Agent List
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Prompt Management                              [+ New Prompt]      │
+│ ────────────────────────────────────────────────────────────────── │
+│  Agent              Version   Last Updated       Author   Action   │
+│  ──────────────────────────────────────────────────────────────── │
+│  researcher         v5        10 min ago         alice    [Edit]   │
+│  summarizer         v2        2 hrs ago          bob      [Edit]   │
+│  classifier         v1        1 day ago          carol    [Edit]   │
+│                                                                     │
+│  Cache: 3 agents loaded  │  Strategy: write-through (no TTL)      │
+└────────────────────────────────────────────────────────────────────┘
+```
+API calls: GET /prompts → GET /prompts/{each agent} → GET /cache/stats
 
-        # ── Step 3: TOOL CALLS ─────────────────────────────────────────────
-        for call in event.get("function_calls", []):
-            agent_data = self.active_spans.get(agent_key)
-            current_sk = agent_data["span_key"] if agent_data else f"{agent_key}::?"
-            tool_key   = f"tool::{current_sk}::{call['id']}"
+---
 
-            self.active_spans[tool_key] = {
-                "type": "tool", "start_perf": curr_perf,
-                "id": call["id"], "span_key": current_sk,
-                "inv_id": inv_id, "author": author,
-            }
-            self._call_id_to_tool_key[(inv_id, author, call["id"])] = tool_key
+### Screen 2 — Edit Prompt
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  ← Back   researcher   (current: v5)                               │
+│ ────────────────────────────────────────────────────────────────── │
+│  Prompt content                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │ You are a research assistant specialising in...              │  │
+│  │                                                              │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  Author ___________________   Change note _______________________  │
+│                                                                     │
+│  [Cancel]          [Save — creates v6 and updates cache instantly]  │
+│                                                                     │
+│  ─────────────────── Version History ──────────────────────────    │
+│  v5  alice   "Improved grounding"          10 min ago  [View]      │
+│  v4  alice   "Added citation rule"         3 hrs ago   [View]      │
+│  v3  bob     "Rollback to v1"              1 day ago   [View] [↩]  │
+│  v2  bob     "Experimental tone"           2 days ago  [View] [↩]  │
+│  v1  carol   "Initial version"             5 days ago  [View] [↩]  │
+└────────────────────────────────────────────────────────────────────┘
+```
+API calls:
+- Load: GET /prompts/researcher  +  GET /prompts/researcher/versions
+- Save: PUT /prompts/researcher  →  cache updated atomically in same request
+- Rollback [↩]: POST /prompts/researcher/rollback  →  cache updated atomically
 
-            traj_idx = self._last_traj_index.get(agent_key)
-            if traj_idx is not None:
-                entry = self.trajectory[traj_idx]
-                entry["tools"].append({
-                    "id": call["id"], "name": call["name"],
-                    "start_time": curr_wall, "duration": None,
-                })
-                self._tool_index[(current_sk, call["id"])] = (
-                    traj_idx, len(entry["tools"]) - 1,
-                )
+After Save or Rollback the UI re-renders from the response body directly —
+the response IS the new cache state, no second fetch needed.
 
-            if agent_data:
-                self._pending_agent_calls[(inv_id, call["name"])] = agent_data["span_key"]
+---
 
-        # ── Step 4: TOOL RESPONSES ─────────────────────────────────────────
-        for resp in event.get("function_responses", []):
-            tool_key = self._call_id_to_tool_key.pop((inv_id, author, resp["id"]), None)
-            if tool_key:
-                data = self.active_spans.pop(tool_key, None)
-                if data:
-                    self._set_tool_duration(
-                        data["span_key"], resp["id"],
-                        round(curr_perf - data["start_perf"], 3),
-                    )
+### Screen 3 — Cache Inspector
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Cache Inspector           [🔄 Refresh All from GCS]  [🗑 Clear]   │
+│ ────────────────────────────────────────────────────────────────── │
+│  Strategy: write-through (no TTL)        Entries: 3 / 500         │
+│                                                                     │
+│  Agent          Version   Author    Last saved         Action      │
+│  ──────────────────────────────────────────────────────────────── │
+│  researcher     v5        alice     10 min ago   [🔄 Re-fetch GCS] │
+│  summarizer     v2        bob       2 hrs ago    [🔄 Re-fetch GCS] │
+│  classifier     v1        carol     1 day ago    [🔄 Re-fetch GCS] │
+│                                                                     │
+│  ℹ️  Cache is always in sync. Refresh only needed if GCS was       │
+│     edited directly outside this service.                          │
+└────────────────────────────────────────────────────────────────────┘
+```
+API calls: GET /cache/stats → POST /cache/refresh/{agent} → DELETE /cache
 
-    # ── Parent / scope logic ───────────────────────────────────────────────
+---
 
-    def _determine_parent_and_scope(
-        self, author: str, inv_id: str
-    ) -> Tuple[Optional[str], bool]:
-        key = (inv_id, author)
-        if key in self._pending_agent_calls:
-            return self._pending_agent_calls.pop(key), True
+## Multi-Pod Consistency
 
-        if not any(v["type"] == "agent" for v in self.active_spans.values()):
-            return None, True
+```
+Pod A receives  PUT /prompts/researcher
+  │
+  ├─► Writes GCS  (shared source of truth — all pods)
+  └─► Updates Pod A's cache immediately (write-through)
 
-        for candidate in reversed(self._context_stack):
-            if candidate in self._scope_creator_sks:
-                return candidate, False
+Pod B, Pod C  ← still hold old version until:
+  a) POST /cache/refresh/researcher is called on them, OR
+  b) DELETE /cache  (next GET per agent refills from GCS)
 
-        closed_scopes = self._scope_creator_sks - set(self._context_stack)
-        if closed_scopes:
-            best = max(closed_scopes, key=lambda sk: self._span_index.get(sk, -1))
-            return best, False
+For most use cases (prompt changes are low-frequency, a few seconds
+of skew between pods is acceptable) no extra work is needed.
 
-        return None, False
+For strict consistency, add to your CI/CD pipeline:
+  curl -X POST /cache/refresh/researcher  (after every PUT)
+```
 
-    # ── Duration setters ──────────────────────────────────────────────────
+---
 
-    def _set_agent_duration(self, span_key: str, duration: float) -> None:
-        idx = self._span_index.get(span_key)
-        if idx is not None:
-            self.trajectory[idx]["duration"] = duration
+## CI/CD Integration
 
-    def _set_tool_duration(self, span_key: str, call_id: str, duration: float) -> None:
-        ref = self._tool_index.pop((span_key, call_id), None)
-        if ref:
-            i, j = ref
-            self.trajectory[i]["tools"][j]["duration"] = duration
-
-    # ── Agent cleanup ─────────────────────────────────────────────────────
-
-    def _cleanup_agent(self, sk: str) -> None:
-        try:
-            self._context_stack.remove(sk)
-        except ValueError:
-            pass
-
-        agent_key = self._sk_to_agent_key.get(sk)
-        if agent_key:
-            self._last_traj_index.pop(agent_key, None)
-
-        if sk in self._scope_creator_sks:
-            active_sks = {
-                v["span_key"] for v in self.active_spans.values()
-                if v["type"] == "agent"
-            }
-            if not (self._children_of.get(sk, set()) & active_sks):
-                self._scope_creator_sks.discard(sk)
-                self._children_of.pop(sk, None)
-
-        for parent_sk, child_set in list(self._children_of.items()):
-            if sk in child_set:
-                child_set.discard(sk)
-                parent_agent_key = self._sk_to_agent_key.get(parent_sk)
-                parent_closed = (
-                    not parent_agent_key
-                    or parent_agent_key not in self.active_spans
-                )
-                if (parent_sk in self._scope_creator_sks
-                        and parent_closed and not child_set):
-                    self._scope_creator_sks.discard(parent_sk)
-                    self._children_of.pop(parent_sk, None)
-                break
-
-        self._sk_to_agent_key.pop(sk, None)
-
-    # ── Pretty print ──────────────────────────────────────────────────────
-
-    def print_summary(self) -> None:
-        for item in self.trajectory:
-            indent = "  " * item.get("level", 0)
-            dur    = f"{item['duration']}s" if item["duration"] is not None else "n/a"
-            print(f"{indent}Agent: {item['name']}  dur={dur}")
-            for t in item.get("tools", []):
-                tdur = f"{t['duration']}s" if t["duration"] is not None else "n/a"
-                print(f"{indent}  └── Tool: {t['name']}  dur={tdur}")
+```yaml
+# .github/workflows/update-prompt.yml
+- name: Push new prompt version
+  run: |
+    curl -sX PUT https://prompt-service.internal/prompts/researcher \
+      -H "X-API-Key: ${{ secrets.PROMPT_API_KEY }}" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "content":     "'"$(cat prompts/researcher.txt)"'",
+        "author":      "github-actions",
+        "change_note": "Deploy from ${{ github.sha }}"
+      }'
+    # Optionally force all pods to pick it up immediately:
+    curl -sX POST https://prompt-service.internal/cache/refresh/researcher \
+      -H "X-API-Key: ${{ secrets.PROMPT_API_KEY }}"
