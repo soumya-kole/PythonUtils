@@ -1,126 +1,110 @@
-# Prompt Management Service — Architecture & UI Flow
+# Prompt Management System — Architecture & UI Flow
 
-## System Architecture
+## Two-Component Design
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          GKE Cluster                                  │
-│                                                                        │
-│   ┌─────────────────────────────────────────────────────────────┐    │
-│   │  prompt-service  (2–10 pods, HPA)                           │    │
-│   │                                                              │    │
-│   │   ┌──────────────────────────────────────────────────────┐  │    │
-│   │   │  FastAPI  (uvicorn, single worker per pod)            │  │    │
-│   │   │                                                        │  │    │
-│   │   │  GET /prompts/{agent}  ──►  In-Memory Cache           │  │    │
-│   │   │                              (dict, no TTL)            │  │    │
-│   │   │                                │                       │  │    │
-│   │   │                         Hit ◄──┤──► Miss               │  │    │
-│   │   │                          │         │                   │  │    │
-│   │   │                    return O(1)    fetch GCS            │  │    │
-│   │   │                                   store in cache       │  │    │
-│   │   │                                   return               │  │    │
-│   │   │                                                        │  │    │
-│   │   │  PUT /prompts/{agent}                                  │  │    │
-│   │   │       │                                                │  │    │
-│   │   │       ├─► 1. Write to GCS   (source of truth)         │  │    │
-│   │   │       └─► 2. cache.set(doc) (write-through — O(1))    │  │    │
-│   │   │                Cache is now consistent. No poll.       │  │    │
-│   │   └──────────────────────────────────────────────────────┘  │    │
-│   └─────────────────────────────────────────────────────────────┘    │
-│                              │  Workload Identity                      │
-│                              ▼                                         │
-│                 ┌────────────────────────┐                             │
-│                 │  Google Cloud Storage  │                             │
-│                 │                        │                             │
-│                 │  prompts/              │                             │
-│                 │  ├─ researcher/        │                             │
-│                 │  │  ├─ latest.json  ◄──┼── always current           │
-│                 │  │  ├─ v1.json         │   immutable snapshots       │
-│                 │  │  └─ v2.json         │                             │
-│                 │  └─ summarizer/        │                             │
-│                 │     ├─ latest.json     │                             │
-│                 │     └─ v1.json         │                             │
-│                 └────────────────────────┘                             │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Component 1: Management API  (FastAPI on GKE)                          │
+│  ─────────────────────────────────────────────                          │
+│  Used by: React admin UI, CI/CD pipelines                               │
+│  Purpose: Create, update, rollback, view version history                │
+│  Cache:   NONE — every request reads/writes GCS directly                │
+└─────────────────────────────────────────────────────────────────────────┘
 
-Consumers (ADK agents, services)
-    └── GET /prompts/{agent_name}  →  prompt string  (always memory read)
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Component 2: PromptLoader SDK  (Python library, runs inside each agent)│
+│  ──────────────────────────────────────────────────────────────────     │
+│  Used by: every ADK agent                                               │
+│  Purpose: Load prompts with zero latency                                │
+│  Cache:   In-process dict, no TTL, invalidated only by version bump     │
+│  FastAPI: NEVER called — direct GCS SDK                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                    ┌──────────────────────────┐
+                    │   Google Cloud Storage    │
+                    │                           │
+                    │  prompts/                 │
+                    │  ├─ _versions.json  ◄─────┼── management API writes
+                    │  │  {"researcher":5,       │   agents poll this file
+                    │  │   "summarizer":2}       │
+                    │  ├─ researcher/            │
+                    │  │  ├─ latest.json         │
+                    │  │  ├─ v1.json             │
+                    │  │  └─ v5.json             │
+                    │  └─ summarizer/            │
+                    │     ├─ latest.json         │
+                    │     └─ v2.json             │
+                    └──────────────────────────┘
+                         ▲                ▲
+                         │                │
+                  Management API      PromptLoader
+               (admin UI writes)    (agents read)
 ```
 
 ---
 
-## Cache Strategy — Write-Through, No TTL
+## Read Path — Zero FastAPI Involvement
 
 ```
-                      ┌─────────────────────────────────────────┐
-                      │  When is the cache updated?              │
-                      │                                          │
-                      │  ✅ Startup warm   — every existing     │
-                      │     GCS prompt is pre-loaded.            │
-                      │                                          │
-                      │  ✅ PUT /prompts   — GCS write returns   │
-                      │     the doc; that exact object is        │
-                      │     stored in cache atomically.          │
-                      │     Zero latency, zero GCS re-read.      │
-                      │                                          │
-                      │  ✅ POST /rollback — same as above.      │
-                      │                                          │
-                      │  ✅ Cold miss      — first GET for a     │
-                      │     brand-new agent fetches GCS once     │
-                      │     and caches permanently.              │
-                      │                                          │
-                      │  ✅ Manual refresh — escape hatch for    │
-                      │     direct GCS edits outside the service.│
-                      │                                          │
-                      │  ❌ Time           — entries NEVER       │
-                      │     expire by time. No TTL, no poll.     │
-                      └─────────────────────────────────────────┘
-
-Write path (PUT /prompts/{agent})
-─────────────────────────────────
-  Request
+Agent starts
     │
-    ├─► gcs_client.save(agent, content, author, note)
-    │         │
-    │         │   Writes  prompts/agent/v{N}.json  (immutable snapshot)
-    │         │   Writes  prompts/agent/latest.json (overwrites pointer)
-    │         │
-    │         └─► returns PromptDocument(version=N, content=..., ...)
-    │
-    └─► cache.set(agent, doc)     ← single dict assignment under asyncio.Lock
+    └─► loader = PromptLoader(bucket="my-prompts-bucket")
               │
-              Cache now holds v{N}.  All subsequent GETs read from memory.
-              No window of staleness.  No background task needed.
+              └─► starts background watcher thread
 
-Read path (GET /prompts/{agent})
-─────────────────────────────────
-  Cache hit  → return _store[agent]                   O(1), no I/O
-  Cache miss → fetch GCS → store → return             one GCS read, then O(1) forever
+agent.run(prompt=loader.get("researcher"))
+    │
+    └─► loader.get("researcher")
+              │
+         In cache? ──YES──► return content string   ← O(1), pure memory
+              │
+              NO (cold miss — only on first call)
+              │
+              └─► fetch prompts/researcher/latest.json from GCS
+                        │
+                        └─► store in dict, return content string
+
+Background watcher (every 30s, configurable):
+    │
+    └─► fetch prompts/_versions.json          ← ONE small GCS read
+              │
+         Compare each cached agent's version vs manifest
+              │
+         Version unchanged ──► nothing to do
+              │
+         Version bumped     ──► fetch prompts/{agent}/latest.json
+                                store new content in dict
+                                next loader.get() returns new content
 ```
 
 ---
 
-## API Reference
+## Write Path — What Happens When a Prompt is Saved
 
-| Method | Endpoint                          | Auth | Description                              |
-|--------|-----------------------------------|------|------------------------------------------|
-| GET    | `/health`                         | —    | Liveness / readiness probe               |
-| GET    | `/prompts`                        | —    | List all agent names (from GCS)          |
-| GET    | `/prompts/{agent}`                | —    | Get current prompt — always memory hit   |
-| PUT    | `/prompts/{agent}`                | ✓    | Save new version → write-through cache   |
-| DELETE | `/prompts/{agent}`                | ✓    | Delete all GCS versions + evict cache    |
-| GET    | `/prompts/{agent}/versions`       | —    | Full version history from GCS            |
-| GET    | `/prompts/{agent}/versions/{N}`   | —    | Retrieve a specific historical version   |
-| POST   | `/prompts/{agent}/rollback`       | ✓    | Promote old version as new latest        |
-| GET    | `/cache/stats`                    | —    | Show all cached agents and versions      |
-| POST   | `/cache/refresh`                  | ✓    | Re-fetch ALL agents from GCS (escape hatch) |
-| POST   | `/cache/refresh/{agent}`          | ✓    | Re-fetch one agent from GCS (escape hatch)  |
-| DELETE | `/cache`                          | ✓    | Clear entire cache (next GETs refill it) |
-
-> The /cache/refresh endpoints exist only as an escape hatch for the rare
-> case where a GCS object is edited directly outside the service. Under normal
-> operation — all writes go through PUT /prompts/{agent} — they are never needed.
+```
+Admin saves new prompt via UI
+    │
+    └─► PUT /prompts/researcher  (management API)
+              │
+              ├─► write prompts/researcher/v6.json     (immutable snapshot)
+              ├─► write prompts/researcher/latest.json (current pointer)
+              └─► write prompts/_versions.json         {"researcher": 6, ...}
+                            ▲
+                            │
+              ← This is the only signal agents need ─────────────────────┐
+                                                                          │
+Agent background watcher (fires within poll_interval seconds)            │
+    │                                                                     │
+    └─► reads _versions.json ◄────────────────────────────────────────────┘
+              │
+         sees "researcher": 6  but local cache has version 5
+              │
+         fetches prompts/researcher/latest.json
+              │
+         updates in-memory dict
+              │
+    Next loader.get("researcher") returns new v6 content
+```
 
 ---
 
@@ -128,145 +112,174 @@ Read path (GET /prompts/{agent})
 
 ```
 prompts/
-└── {agent_name}/
-    ├── latest.json     ← overwritten on every save; always current version
-    ├── v1.json         ← immutable — never modified after creation
-    ├── v2.json
-    └── v3.json
+├─ _versions.json              ← { "researcher": 6, "summarizer": 2 }
+│                                 Tiny manifest. Written on every save.
+│                                 Agents poll this file only.
+├─ researcher/
+│  ├─ latest.json              ← Full PromptDocument, always current
+│  ├─ v1.json                  ← Immutable snapshots
+│  └─ v6.json
+└─ summarizer/
+   ├─ latest.json
+   └─ v2.json
 
-Schema (every file):
+PromptDocument schema:
 {
   "agent_name":  "researcher",
   "content":     "You are a research assistant...",
-  "version":     3,
+  "version":     6,
   "author":      "alice@company.com",
-  "change_note": "Improved grounding instruction",
+  "change_note": "Improved grounding",
   "updated_at":  "2025-03-19T10:00:00Z"
 }
 ```
 
 ---
 
-## Versioning & Rollback
+## Management API Endpoints
+
+| Method | Endpoint                          | Auth | Purpose                           |
+|--------|-----------------------------------|------|-----------------------------------|
+| GET    | `/health`                         | —    | Liveness probe                    |
+| GET    | `/prompts`                        | —    | List all agent names              |
+| GET    | `/prompts/{agent}`                | —    | Show current prompt (UI display)  |
+| PUT    | `/prompts/{agent}`                | ✓    | Save new version + bump manifest  |
+| DELETE | `/prompts/{agent}`                | ✓    | Delete all versions               |
+| GET    | `/prompts/{agent}/versions`       | —    | Full version history              |
+| GET    | `/prompts/{agent}/versions/{N}`   | —    | View a specific version           |
+| POST   | `/prompts/{agent}/rollback`       | ✓    | Promote old version as new latest |
+| GET    | `/manifest`                       | —    | Show _versions.json (for UI/debug)|
+
+---
+
+## PromptLoader SDK Usage
+
+```python
+from prompt_sdk import PromptLoader
+
+# ── Typical agent setup ───────────────────────────────────────────────────
+loader = PromptLoader(
+    bucket="my-prompts-bucket",
+    poll_interval=30,    # seconds between manifest checks (default: 30)
+)
+
+# In agent code — always O(1) after first call
+prompt = loader.get("researcher")
+
+# ── ADK agent example ─────────────────────────────────────────────────────
+from google.adk import Agent
+
+agent = Agent(
+    name="researcher",
+    instruction=loader.get("researcher"),   # loaded from GCS on first call
+    ...
+)
+
+# ── Long-running service: use context manager ─────────────────────────────
+with PromptLoader(bucket="my-prompts-bucket") as loader:
+    while True:
+        prompt = loader.get("researcher")   # always fresh if version bumped
+        result = agent.run(prompt=prompt)
+
+# ── Observability ─────────────────────────────────────────────────────────
+print(loader.cache_info())
+# {"researcher": {"version": 6, "content_length": 312}}
+
+print(loader.get_version("researcher"))   # 6
+```
+
+---
+
+## GCS Read Volume
 
 ```
-Save v1:
-  GCS:  v1.json created  +  latest.json → v1 content
+Without PromptLoader (naive approach):
+  Every agent invocation → 1 GCS read
+  1000 agent calls/min  → 1000 GCS reads/min
 
-Save v2 (update):
-  GCS:  v2.json created  +  latest.json → v2 content
-  v1.json is UNTOUCHED — history preserved forever
+With PromptLoader:
+  Startup per agent instance → 1 GCS read per prompt (cold miss)
+  Steady state               → 1 manifest read per poll_interval per process
+  On version bump            → 1 GCS read per changed agent per process
 
-Rollback to v1:
-  Reads  v1.json content
-  Writes v3.json (rollback content)  +  latest.json → v1 content
-  History: v1 → v2 → v3(rollback)   ← forward-only log, no gaps
+  10 agent instances, 5 prompts, poll_interval=30s:
+    Steady state: 10 × (1 manifest read / 30s) = 20 reads/min
+    On save:      10 × 1 prompt fetch           = 10 reads (one-time burst)
 ```
 
 ---
 
 ## UI Flow (React Admin Panel)
 
-### Screen 1 — Agent List
+### Screen 1 — Prompt List
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│  Prompt Management                              [+ New Prompt]      │
-│ ────────────────────────────────────────────────────────────────── │
-│  Agent              Version   Last Updated       Author   Action   │
-│  ──────────────────────────────────────────────────────────────── │
-│  researcher         v5        10 min ago         alice    [Edit]   │
-│  summarizer         v2        2 hrs ago          bob      [Edit]   │
-│  classifier         v1        1 day ago          carol    [Edit]   │
-│                                                                     │
-│  Cache: 3 agents loaded  │  Strategy: write-through (no TTL)      │
-└────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Prompt Management                              [+ New Prompt]        │
+│ ──────────────────────────────────────────────────────────────────── │
+│  Agent              Current Version   Last Updated    Author          │
+│  ────────────────────────────────────────────────────────────────    │
+│  researcher         v6                5 min ago       alice   [Edit]  │
+│  summarizer         v2                2 hrs ago       bob     [Edit]  │
+│  classifier         v1                1 day ago       carol   [Edit]  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
-API calls: GET /prompts → GET /prompts/{each agent} → GET /cache/stats
+API: `GET /prompts` → `GET /prompts/{each}` (reads GCS directly)
 
 ---
 
 ### Screen 2 — Edit Prompt
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│  ← Back   researcher   (current: v5)                               │
-│ ────────────────────────────────────────────────────────────────── │
-│  Prompt content                                                     │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │ You are a research assistant specialising in...              │  │
-│  │                                                              │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  Author ___________________   Change note _______________________  │
-│                                                                     │
-│  [Cancel]          [Save — creates v6 and updates cache instantly]  │
-│                                                                     │
-│  ─────────────────── Version History ──────────────────────────    │
-│  v5  alice   "Improved grounding"          10 min ago  [View]      │
-│  v4  alice   "Added citation rule"         3 hrs ago   [View]      │
-│  v3  bob     "Rollback to v1"              1 day ago   [View] [↩]  │
-│  v2  bob     "Experimental tone"           2 days ago  [View] [↩]  │
-│  v1  carol   "Initial version"             5 days ago  [View] [↩]  │
-└────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  ← Back   researcher   (current: v6)                                  │
+│ ──────────────────────────────────────────────────────────────────── │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ You are a research assistant specialising in...               │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                        │
+│  Author _______________   Change note _____________________________    │
+│                                                                        │
+│  [Cancel]                               [Save → creates v7]           │
+│                                                                        │
+│  ─────────────────── Version History ──────────────────────────       │
+│  v6  alice  "Improved grounding"       5 min ago   [View]             │
+│  v5  alice  "Added citation rule"      3 hrs ago   [View]             │
+│  v4  bob    "Rollback to v2"           1 day ago   [View]  [↩]        │
+│  v2  bob    "Experimental tone"        2 days ago  [View]  [↩]        │
+│  v1  carol  "Initial version"          5 days ago  [View]  [↩]        │
+└──────────────────────────────────────────────────────────────────────┘
 ```
-API calls:
-- Load: GET /prompts/researcher  +  GET /prompts/researcher/versions
-- Save: PUT /prompts/researcher  →  cache updated atomically in same request
-- Rollback [↩]: POST /prompts/researcher/rollback  →  cache updated atomically
-
-After Save or Rollback the UI re-renders from the response body directly —
-the response IS the new cache state, no second fetch needed.
+- Save: `PUT /prompts/researcher` → v7 written to GCS + `_versions.json` bumped
+- Agents detect v7 within `poll_interval` seconds, fetch automatically
+- Rollback [↩]: `POST /prompts/researcher/rollback` → same manifest bump
 
 ---
 
-### Screen 3 — Cache Inspector
+### Screen 3 — Manifest Inspector
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│  Cache Inspector           [🔄 Refresh All from GCS]  [🗑 Clear]   │
-│ ────────────────────────────────────────────────────────────────── │
-│  Strategy: write-through (no TTL)        Entries: 3 / 500         │
-│                                                                     │
-│  Agent          Version   Author    Last saved         Action      │
-│  ──────────────────────────────────────────────────────────────── │
-│  researcher     v5        alice     10 min ago   [🔄 Re-fetch GCS] │
-│  summarizer     v2        bob       2 hrs ago    [🔄 Re-fetch GCS] │
-│  classifier     v1        carol     1 day ago    [🔄 Re-fetch GCS] │
-│                                                                     │
-│  ℹ️  Cache is always in sync. Refresh only needed if GCS was       │
-│     edited directly outside this service.                          │
-└────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Live Manifest  (_versions.json)                      [🔄 Refresh]   │
+│ ──────────────────────────────────────────────────────────────────── │
+│  Agent              Version   Notes                                   │
+│  ────────────────────────────────────────────────────────────────    │
+│  researcher         6         agents polling this will fetch v6       │
+│  summarizer         2                                                  │
+│  classifier         1                                                  │
+│                                                                        │
+│  This file is what running agents check to detect updates.            │
+│  Agents pick up changes within their configured poll_interval.        │
+└──────────────────────────────────────────────────────────────────────┘
 ```
-API calls: GET /cache/stats → POST /cache/refresh/{agent} → DELETE /cache
-
----
-
-## Multi-Pod Consistency
-
-```
-Pod A receives  PUT /prompts/researcher
-  │
-  ├─► Writes GCS  (shared source of truth — all pods)
-  └─► Updates Pod A's cache immediately (write-through)
-
-Pod B, Pod C  ← still hold old version until:
-  a) POST /cache/refresh/researcher is called on them, OR
-  b) DELETE /cache  (next GET per agent refills from GCS)
-
-For most use cases (prompt changes are low-frequency, a few seconds
-of skew between pods is acceptable) no extra work is needed.
-
-For strict consistency, add to your CI/CD pipeline:
-  curl -X POST /cache/refresh/researcher  (after every PUT)
-```
+API: `GET /manifest`
 
 ---
 
 ## CI/CD Integration
 
 ```yaml
-# .github/workflows/update-prompt.yml
-- name: Push new prompt version
+# Update a prompt without redeploying any agent
+- name: Deploy new prompt version
   run: |
-    curl -sX PUT https://prompt-service.internal/prompts/researcher \
+    curl -sX PUT https://prompt-api.internal/prompts/researcher \
       -H "X-API-Key: ${{ secrets.PROMPT_API_KEY }}" \
       -H "Content-Type: application/json" \
       -d '{
@@ -274,6 +287,6 @@ For strict consistency, add to your CI/CD pipeline:
         "author":      "github-actions",
         "change_note": "Deploy from ${{ github.sha }}"
       }'
-    # Optionally force all pods to pick it up immediately:
-    curl -sX POST https://prompt-service.internal/cache/refresh/researcher \
-      -H "X-API-Key: ${{ secrets.PROMPT_API_KEY }}"
+    # Agents pick up the new version automatically within poll_interval.
+    # No restart, no redeployment, no cache flush endpoint needed.
+```
